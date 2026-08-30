@@ -1,0 +1,77 @@
+# Pull-only deployment: uses the published multi-architecture image from GHCR
+# and never builds anything locally.
+#
+#   printf 'PUID=%s\nPGID=%s\n' "$(id -u)" "$(id -g)" > .env
+#   docker compose -f compose-prod.yaml up -d
+#
+# Use compose.yaml instead if you want to build from this checkout.
+services:
+  yt-dlp-manager:
+    # Pin a release tag (:0.1.0, :0.1) instead of :latest for reproducible
+    # deployments. The image is published for linux/amd64 and linux/arm64.
+    image: ghcr.io/ih8d8/yt-dlp-manager:latest
+    container_name: yt-dlp-manager
+    restart: unless-stopped
+    pull_policy: always
+    # Loopback-only by default.
+    #
+    # To reach it from another device, pick ONE deliberately:
+    #   * behind a TLS reverse proxy (recommended) — keep this loopback bind and
+    #     point the proxy at 127.0.0.1:8080, and set
+    #     YTDLP_MANAGER_SECURE_COOKIE=true below;
+    #   * on a trusted LAN, change the line below to "8080:8080". You are then
+    #     serving plain HTTP: the session cookie crosses the network in the
+    #     clear, so treat that as a lab setup, not a permanent one.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Downloads created in the host bind mount must belong to your host
+      # account. Override these in .env when your IDs are not 1000:1000.
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      YTDLP_MANAGER_LISTEN: 0.0.0.0:8080
+      # First-run administrator setup needs the one-time token this container
+      # prints at startup, because requests arrive through Docker's port proxy
+      # rather than from the host itself, and a Host header proves nothing
+      # about who is connecting. Open http://127.0.0.1:8080, then:
+      #   docker compose logs yt-dlp-manager | grep 'setup token'
+      # and paste it into the setup screen. It changes on every restart and
+      # stops working once the password is set.
+      #
+      # Extra names accepted in the Host header (a reverse proxy's, say):
+      # YTDLP_MANAGER_TRUSTED_HOSTS: "nas.lan:8080,192.168.1.10:8080"
+      # Set to true when serving HTTPS through your reverse proxy.
+      YTDLP_MANAGER_SECURE_COOKIE: "false"
+      # Lets the web UI edit yt-dlp options (download dir, format, output
+      # template, …) from Settings → Downloads, inside a clearly marked block
+      # in your yt-dlp config. On by default here because a fresh container
+      # needs its download directory pointed at /downloads first. Set it to
+      # "false" once you are happy with the settings: it lets anyone with an
+      # admin session change where downloads are written.
+      YTDLP_MANAGER_ALLOW_YTDLP_CONFIG_EDIT: "true"
+    volumes:
+      - ~/Downloads/yt-dlp:/downloads
+      - yt_dlp_manager_config:/config
+      - yt_dlp_manager_state:/state
+    read_only: true
+    # /tmp is the only writable place left once the root filesystem is
+    # read-only, so it is mounted noexec: nothing downloaded there can be run.
+    tmpfs:
+      - /tmp:size=256m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    # The entrypoint starts as root only to repair ownership of its OWN volume
+    # roots, then drops to PUID:PGID via su-exec. DAC_OVERRIDE is deliberately
+    # not granted.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+
+volumes:
+  yt_dlp_manager_config:
+  yt_dlp_manager_state:

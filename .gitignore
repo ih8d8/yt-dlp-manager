@@ -1,0 +1,23 @@
+# Build output
+/bin/
+
+# Node dependencies (any depth)
+node_modules/
+
+# Secrets
+.env
+.env.*
+*.secret
+*.secret*
+*.key
+
+# Runtime bind-mount targets created by compose.yaml. These are anchored to the
+# repository root on purpose: unanchored, `config/` and `state/` also match
+# internal/config/ and internal/webui/frontend/src/state/, which are source.
+/downloads/
+/config/
+/state/
+
+# Playwright browser tests
+e2e/test-results/
+e2e/playwright-report/

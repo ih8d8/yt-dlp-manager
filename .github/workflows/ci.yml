@@ -1,0 +1,276 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default; nothing here publishes anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v node_modules || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Tests
+        run: go test -count=1 ./...
+
+      # The manager is almost entirely concurrent, so the race detector is not
+      # optional here — it is the test run that matters.
+      - name: Tests (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Cross-compile every released target
+        run: |
+          set -eu
+          for t in linux/amd64 linux/arm64 linux/arm darwin/amd64 darwin/arm64 freebsd/amd64; do
+            echo "  $t"
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/yt-dlp-manager
+          done
+
+  frontend:
+    name: Web UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: internal/webui/frontend/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+        working-directory: internal/webui/frontend
+
+      - run: npm run typecheck
+        working-directory: internal/webui/frontend
+
+      - run: npm test
+        working-directory: internal/webui/frontend
+
+      # internal/webui/static is a committed build artifact that `go build`
+      # embeds, so a plain checkout needs no Node. That convenience only holds
+      # if the snapshot actually matches the source — it has silently drifted
+      # before, shipping a UI that did not match the code in the repo.
+      - name: Committed bundle matches the frontend source
+        run: |
+          npm run build --prefix internal/webui/frontend
+          if ! git diff --quiet -- internal/webui/static; then
+            echo "internal/webui/static is stale. Run 'make frontend' and commit the result."
+            git --no-pager diff --stat -- internal/webui/static
+            exit 1
+          fi
+
+  # Vulnerability checks were being run by hand at review time, which means
+  # they were only as current as the last person who remembered. govulncheck
+  # reports reachable Go advisories (call-graph based, so it stays quiet about
+  # code the binary never runs); npm audit covers the whole tree, dev tooling
+  # included — vite and tsc do not ship to a browser, but they execute here
+  # over the repository, which is its own exposure.
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      # A malformed workflow is uniquely bad at reporting its own failure: it
+      # never starts. Keep syntax, expressions and embedded shell checked by a
+      # pinned linter while the files are still on a pull request.
+      - name: GitHub Actions workflow lint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: |
+            internal/webui/frontend/package-lock.json
+            e2e/package-lock.json
+
+      - name: Frontend npm audit
+        run: npm audit --audit-level=high
+        working-directory: internal/webui/frontend
+
+      - name: Browser-test npm audit
+        run: npm audit --audit-level=high
+        working-directory: e2e
+
+  # Real-browser coverage of the embedded UI. This is the layer where the
+  # server's headers and the page the browser actually builds meet — nothing
+  # below it can tell whether the CSP the server sends and the UI it serves
+  # agree, or whether a route renders at all.
+  e2e:
+    name: Browser E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      # The binary embeds internal/webui/static, so it has to be built from this
+      # checkout; the `frontend` job above is what proves that snapshot matches
+      # the source it was built from.
+      - name: Build the server
+        run: go build -o bin/yt-dlp-manager ./cmd/yt-dlp-manager
+
+      - run: npm ci --no-audit --no-fund
+        working-directory: e2e
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - run: npm test
+        working-directory: e2e
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            e2e/test-results
+            e2e/playwright-report
+          retention-days: 7
+
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Entrypoint shell check
+        run: |
+          sh -n docker-entrypoint.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck docker-entrypoint.sh
+
+      - name: Compose files are valid
+        run: |
+          docker compose -f compose.yaml config >/dev/null
+          docker compose -f compose-prod.yaml config >/dev/null
+
+      # ARG ALPINE_VERSION only feeds an OCI label, so nothing fails when it
+      # falls behind the FROM line — the image just reports a base version it is
+      # not built on. Dependabot updates the literal FROM and cannot know about
+      # the ARG, so that drift is the expected outcome, not a hypothetical one.
+      # Catching it here is what keeps the label honest.
+      - name: Alpine label matches the base image it is built from
+        run: |
+          set -euo pipefail
+          arg=$(sed -n 's/^ARG ALPINE_VERSION=\(.*\)$/\1/p' Dockerfile)
+          from=$(sed -n 's/^FROM alpine:\([^@ ]*\).*/\1/p' Dockerfile)
+          if [ -z "$arg" ] || [ -z "$from" ]; then
+            echo "could not read both values" >&2
+            exit 1
+          fi
+          if [ "$arg" != "$from" ]; then
+            echo "::error file=Dockerfile::ARG ALPINE_VERSION=$arg but the runtime stage builds FROM alpine:$from - update the ARG to match" >&2
+            exit 1
+          fi
+          echo "alpine $arg matches the FROM line"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: yt-dlp-manager:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Dependency audits above cover source package managers; this covers the
+      # Alpine, ffmpeg, Python and other runtime packages present only in the
+      # final image. Unfixed advisories are reported but do not make releases
+      # impossible; a fixable HIGH/CRITICAL issue does.
+      - name: Scan runtime image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: yt-dlp-manager:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
+          exit-code: '1'
+
+      # A green build is not proof the image works. Start it the way the Compose
+      # file does — non-root, read-only rootfs, no DAC_OVERRIDE, noexec /tmp —
+      # and require it to come up and report ready.
+      - name: Smoke test the image
+        run: |
+          set -eu
+          mkdir -p /tmp/dl /tmp/cfg /tmp/st && chmod 777 /tmp/dl /tmp/cfg /tmp/st
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 \
+            -e "PUID=$(id -u)" -e "PGID=$(id -g)" \
+            -e YTDLP_MANAGER_LISTEN=0.0.0.0:8080 \
+            -v /tmp/dl:/downloads -v /tmp/cfg:/config -v /tmp/st:/state \
+            --read-only --tmpfs /tmp:size=128m,mode=1777,noexec,nosuid,nodev \
+            --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true yt-dlp-manager:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8080/healthz
+          curl -fsS http://127.0.0.1:8080/readyz
+
+          # The application process must hold no capabilities at all.
+          caps=$(docker exec smoke sh -c 'grep ^CapEff /proc/1/status' | awk '{print $2}')
+          test "$caps" = "0000000000000000" || { echo "app has capabilities: $caps"; exit 1; }
+
+          # ...and must not be root.
+          uid=$(docker exec smoke sh -c 'awk "/^Uid:/{print \$2}" /proc/1/status')
+          test "$uid" != "0" || { echo "app is running as root"; exit 1; }
+
+          docker logs smoke
+          docker rm -f smoke

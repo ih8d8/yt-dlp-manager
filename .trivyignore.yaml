@@ -1,0 +1,9 @@
+vulnerabilities:
+  - id: CVE-2023-31922
+    expired_at: 2026-12-31
+    statement: >-
+      Trivy misorders Alpine's date-based quickjs version 0.20250913-r0 below
+      its stated fixed version 2021-03-27-r5. The CVE only identifies the
+      2022-03-06 release as affected, and its public nested-Proxy proof of
+      concept terminates safely with a catchable InternalError in this image.
+      Recheck this narrowly scoped exception before it expires.

@@ -1,0 +1,119 @@
+# yt-dlp is the one dependency no package manager can see: the Dockerfile pins a
+# release tag and fetches the zipapp from GitHub, so Dependabot has nothing to
+# parse. It is also the dependency that matters most — yt-dlp ships every week
+# or two and a stale one means broken downloads, not a cosmetic lag.
+#
+# Runs on GitHub's runners, not on anyone's machine.
+name: yt-dlp update
+
+on:
+  schedule:
+    # Mondays 06:17 UTC. Off the hour on purpose: GitHub drops scheduled runs
+    # that pile up on :00 across the whole platform.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: yt-dlp-update
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare pinned release against upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^ARG YT_DLP_VERSION=\(.*\)$/\1/p' Dockerfile)
+          latest=$(gh release view --repo yt-dlp/yt-dlp --json tagName --jq .tagName)
+          if [ -z "$current" ] || [ -z "$latest" ]; then
+            echo "could not read versions" >&2
+            exit 1
+          fi
+          # The tag is about to be consumed by steps running with contents:write.
+          # Git ref names may legally contain shell metacharacters, so only the
+          # shape yt-dlp actually publishes (YYYY.MM.DD[.N]) is allowed through.
+          printf '%s' "$latest" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || {
+            echo "refusing upstream tag with unexpected format: $latest" >&2; exit 1; }
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "up-to-date=true" >> "$GITHUB_OUTPUT"
+            echo "Already on $current."
+          else
+            echo "up-to-date=false" >> "$GITHUB_OUTPUT"
+            echo "$current -> $latest"
+          fi
+
+      # The Dockerfile downloads both of these and verifies one against the
+      # other. If either is missing the build would fail *after* the PR merged,
+      # so the release is checked for them before anything is proposed.
+      - name: Verify the release ships the assets the build needs
+        if: steps.check.outputs.up-to-date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Via the environment, never interpolated into the script body: a
+          # ${{ }} expression is pasted in as source text before bash sees it.
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          set -euo pipefail
+          assets=$(gh release view "$LATEST" \
+            --repo yt-dlp/yt-dlp --json assets --jq '.assets[].name')
+          for want in yt-dlp SHA2-256SUMS; do
+            grep -qx "$want" <<< "$assets" || { echo "release is missing '$want'" >&2; exit 1; }
+          done
+
+      - name: Open or update the bump PR
+        if: steps.check.outputs.up-to-date == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          CURRENT: ${{ steps.check.outputs.current }}
+        run: |
+          set -euo pipefail
+          branch="yt-dlp-update/${LATEST}"
+          # Nothing to do if this exact bump was already proposed and is still open.
+          # Every state, not just open: a closed PR means this bump was already
+          # offered and declined, and reopening it weekly would be nagging.
+          existing=$(gh pr list --head "$branch" --state all --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "A PR for $branch already exists (open, closed or merged); leaving it alone."
+            exit 0
+          fi
+          # The remote branch can outlive its PR. Fetch it when present so
+          # --force-with-lease has a tracking ref to compare against; without one
+          # git rejects the push and every future run fails the same way.
+          git fetch --no-tags origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
+          sed -i "s/^ARG YT_DLP_VERSION=.*/ARG YT_DLP_VERSION=${LATEST}/" Dockerfile
+          git diff --quiet && { echo "Dockerfile unchanged; nothing to propose."; exit 0; }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "Bump yt-dlp from ${CURRENT} to ${LATEST}"
+          git push --force-with-lease origin "$branch"
+          # Asked for explicitly rather than taken from the event payload, which
+          # differs between the schedule and workflow_dispatch triggers.
+          base=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+          gh pr create --base "$base" --head "$branch" \
+            --title "Bump yt-dlp from ${CURRENT} to ${LATEST}" \
+            --body "$(printf '%s\n' \
+              "Upstream release: https://github.com/yt-dlp/yt-dlp/releases/tag/${LATEST}" \
+              "" \
+              "The release was checked for the \`yt-dlp\` and \`SHA2-256SUMS\` assets the image build downloads." \
+              "" \
+              "> Note: CI may not start on this PR by itself — workflow runs from a" \
+              "> \`GITHUB_TOKEN\`-authored PR are restricted. Check the Checks tab: if a run is" \
+              "> waiting for approval, approve it; if nothing is queued, push any commit to the" \
+              "> branch. Use a GitHub App or PAT if this must run unattended." \
+              "> Do not merge without a green CI run.")"

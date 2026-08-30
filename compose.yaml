@@ -1,0 +1,110 @@
+services:
+  yt-dlp-manager:
+    build:
+      # The pinned yt-dlp release lives in the Dockerfile (ARG YT_DLP_VERSION)
+      # so there is exactly one place to bump it.
+      context: .
+      # Stamp the binary with its real version. Without these the About page in
+      # the web UI reports "dev (unknown, built unknown)": .dockerignore keeps
+      # .git out of the build context, so the build cannot work them out on its
+      # own. Compose cannot run a command, so it reads them from the
+      # environment. Use `make up`, which exports all three from git and then
+      # runs `docker compose up -d --build`. Running `docker compose up --build`
+      # directly is what leaves the About page reporting dev/unknown/unknown.
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        APP_COMMIT: ${APP_COMMIT:-unknown}
+        APP_DATE: ${APP_DATE:-unknown}
+    image: yt-dlp-manager:latest
+    container_name: yt-dlp-manager
+    restart: unless-stopped
+    # Loopback-only by default: the comment below and the README both promise
+    # this, and "0.0.0.0:8080:8080" here silently published the app to the whole
+    # LAN instead.
+    #
+    # To reach it from another device, pick ONE deliberately:
+    #   * behind a TLS reverse proxy (recommended) — keep this loopback bind and
+    #     point the proxy at 127.0.0.1:8080, and set
+    #     YTDLP_MANAGER_SECURE_COOKIE=true below;
+    #   * on a trusted LAN, change the line below to "8080:8080". You are then
+    #     serving plain HTTP: the session cookie crosses the network in the
+    #     clear, so treat that as a lab setup, not a permanent one.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Downloads created in the host bind mount must belong to your host
+      # account. Override these in .env when your IDs are not 1000:1000:
+      #   PUID=1000
+      #   PGID=1000
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      YTDLP_MANAGER_LISTEN: 0.0.0.0:8080
+      # First-run administrator setup needs the one-time token this container
+      # prints at startup, because requests arrive through Docker's port proxy
+      # rather than from the host itself, and a Host header proves nothing
+      # about who is connecting. Open http://127.0.0.1:8080, then:
+      #   docker compose logs yt-dlp-manager | grep 'setup token'
+      # and paste it into the setup screen. It changes on every restart and
+      # stops working once the password is set.
+      #
+      # Extra names accepted in the Host header (a reverse proxy's, say):
+      # YTDLP_MANAGER_TRUSTED_HOSTS: "nas.lan:8080,192.168.1.10:8080"
+      # Set to true when serving HTTPS through your reverse proxy.
+      YTDLP_MANAGER_SECURE_COOKIE: "false"
+      # Lets the web UI edit yt-dlp options (download dir, format, output
+      # template, …) from Settings → Downloads. The edits are confined to a
+      # clearly marked block in your yt-dlp config; everything outside stays
+      # untouched, and no dangerous directive can ever be written.
+      #
+      # On by default here because a fresh container needs its download
+      # directory pointed at /downloads before anything can be fetched. Set it
+      # to "false" once you are happy with the settings: it lets anyone with an
+      # admin session change where downloads are written.
+      YTDLP_MANAGER_ALLOW_YTDLP_CONFIG_EDIT: "true"
+    volumes:
+      # Downloads use a host bind and are created as PUID:PGID; config/state
+      # use named volumes whose app-owned paths are prepared by the entrypoint.
+      - ~/Downloads/yt-dlp:/downloads
+      - yt_dlp_manager_config:/config
+      - yt_dlp_manager_state:/state
+
+      # --- Prefer plain host directories instead? Replace the three lines
+      # above with these binds — but create them YOURSELF before the first
+      # `up`, because directories auto-created by Docker end up root-owned
+      # and the container may be unable to use them:
+      #
+      #   mkdir -p downloads config state
+      #   sudo chown -R "$(id -u):$(id -g)" downloads config state
+      #
+      # - ./downloads:/downloads
+      # - ./config:/config
+      # - ./state:/state
+    read_only: true
+    # /tmp is the only writable-and-executable place left once the root
+    # filesystem is read-only, so it is mounted noexec: nothing the app
+    # downloads there can be run. yt-dlp, ffmpeg and QuickJS only ever read
+    # files from /tmp, so this costs nothing.
+    tmpfs:
+      - /tmp:size=256m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    # The image entrypoint starts as root only to repair ownership of its OWN
+    # volume roots (never recursive over the media tree), then drops to
+    # PUID:PGID via su-exec. These four are the exact capabilities that needs.
+    #
+    # DAC_OVERRIDE is deliberately NOT here. It lets root bypass every file
+    # permission check, and the entrypoint no longer needs it: it chowns only
+    # the volume roots (CHOWN suffices) and lets the application user create
+    # its own subdirectories underneath.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+
+volumes:
+  yt_dlp_manager_config:
+  yt_dlp_manager_state:

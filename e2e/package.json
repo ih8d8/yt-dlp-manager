@@ -1,0 +1,12 @@
+{
+  "name": "yt-dlp-manager-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Real-browser tests for the embedded web UI",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  }
+}

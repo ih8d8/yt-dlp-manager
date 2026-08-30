@@ -1,0 +1,59 @@
+# Grouped on purpose. An earlier ungrouped config produced 13 open PRs in two
+# days, which is why it got deleted — the mechanism was fine, the volume was
+# not. One PR per ecosystem per week is reviewable; thirteen is not.
+#
+# Majors are deliberately left OUT of the groups so they arrive as their own
+# PRs: a TypeScript 5 -> 7 or actions/checkout v4 -> v7 jump needs a human and a
+# full local build, and must not ride along inside a "chore: bump deps" PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Reads the literal FROM references in the Dockerfile and bumps tag AND
+  # digest together. This only works because those lines are literal — with
+  # `FROM alpine:${ALPINE_VERSION}` the updater silently finds nothing.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]
+        # Same policy as the other ecosystems, which this silently omitted:
+        # without it Dependabot groups every level, so an alpine 3.x -> 4.0 or
+        # node 26 -> 28 jump would ride inside the routine weekly PR.
+        update-types: [minor, patch]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /internal/webui/frontend
+    schedule:
+      interval: weekly
+    groups:
+      frontend:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule:
+      interval: weekly
+    groups:
+      e2e:
+        patterns: ["*"]
+        update-types: [minor, patch]

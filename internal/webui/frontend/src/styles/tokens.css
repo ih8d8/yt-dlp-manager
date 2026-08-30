@@ -1,0 +1,111 @@
+:root {
+  --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  --bg: #0b1017;
+  --panel: #101720;
+  --raised: #19212c;
+  --border: #29323d;
+  --text: #f3f4f6;
+  --muted: #a5acb8;
+  --accent: #6674e8;
+  --active-blue: #6385ff;
+  --success: #43c777;
+  --warning: #f2ad32;
+  --danger: #ef5350;
+
+  --radius: 8px;
+  --motion: 140ms;
+  --topbar-h: 68px;
+  --sidebar-w: 256px;
+
+
+  /* Surfaces that used to be hardcoded in components.css. Keeping them here is
+     what makes the light theme complete by construction: a component that
+     reaches for a token cannot forget to have a light value. */
+  --app-bg:
+    radial-gradient(circle at 72% 14%, rgba(41, 57, 77, 0.2), transparent 40%),
+    linear-gradient(135deg, #090e14 0%, var(--bg) 55%, #0d151e 100%);
+  --surface-glass: rgba(9, 14, 20, 0.9);
+  --surface-rail: rgba(12, 18, 26, 0.78);
+  --surface-table: rgba(15, 22, 31, 0.76);
+  --surface-row: rgba(15, 22, 31, 0.9);
+  --surface-menu: rgba(15, 22, 31, 0.92);
+  --input-bg: rgba(10, 15, 22, 0.72);
+  --accent-wash: rgba(95, 134, 255, 0.08);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --scrim-soft: rgba(0, 0, 0, 0.45);
+  --shadow-1: 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 12px 40px rgba(0, 0, 0, 0.45);
+  --on-accent: #fff;
+  --on-warning: #111318;
+  --pill-tint-downloading: rgba(95, 134, 255, 0.12);
+  --pill-tint-neutral: rgba(156, 163, 175, 0.12);
+  --pill-tint-paused: rgba(242, 173, 50, 0.12);
+  --pill-tint-completed: rgba(67, 199, 119, 0.12);
+  --pill-tint-failed: rgba(239, 83, 80, 0.12);
+
+  /* state hues reused by pills and bars */
+  --st-downloading: var(--active-blue);
+  --st-queued: var(--muted);
+  --st-paused: var(--warning);
+  --st-completed: var(--success);
+  --st-failed: var(--danger);
+}
+
+[data-theme='light'] {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --raised: #eceef2;
+  --border: #d3d7de;
+  --text: #1a1d23;
+  --muted: #5b6472;
+  --accent: #4351c9;
+  --app-bg: var(--bg);
+  --surface-glass: rgba(255, 255, 255, 0.92);
+  --surface-rail: rgba(255, 255, 255, 0.86);
+  --surface-table: var(--panel);
+  --surface-row: var(--panel);
+  --surface-menu: var(--panel);
+  --input-bg: #ffffff;
+  --accent-wash: rgba(95, 134, 255, 0.07);
+  --scrim: rgba(24, 28, 35, 0.38);
+  --scrim-soft: rgba(24, 28, 35, 0.28);
+  --shadow-1: 0 6px 18px rgba(24, 28, 35, 0.10);
+  --shadow-2: 0 14px 40px rgba(24, 28, 35, 0.16);
+  --pill-tint-downloading: transparent;
+  --pill-tint-neutral: transparent;
+  --pill-tint-paused: transparent;
+  --pill-tint-completed: transparent;
+  --pill-tint-failed: transparent;
+}
+
+/* "system" follows the OS. Same values as the explicit light theme — kept in
+   one place below so the two can never drift apart. */
+@media (prefers-color-scheme: light) {
+  [data-theme='system'] {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --raised: #eceef2;
+    --border: #d3d7de;
+    --text: #1a1d23;
+    --muted: #5b6472;
+    --accent: #4351c9;
+  --app-bg: var(--bg);
+  --surface-glass: rgba(255, 255, 255, 0.92);
+  --surface-rail: rgba(255, 255, 255, 0.86);
+  --surface-table: var(--panel);
+  --surface-row: var(--panel);
+  --surface-menu: var(--panel);
+  --input-bg: #ffffff;
+  --accent-wash: rgba(95, 134, 255, 0.07);
+  --scrim: rgba(24, 28, 35, 0.38);
+  --scrim-soft: rgba(24, 28, 35, 0.28);
+  --shadow-1: 0 6px 18px rgba(24, 28, 35, 0.10);
+  --shadow-2: 0 14px 40px rgba(24, 28, 35, 0.16);
+  --pill-tint-downloading: transparent;
+  --pill-tint-neutral: transparent;
+  --pill-tint-paused: transparent;
+  --pill-tint-completed: transparent;
+  --pill-tint-failed: transparent;
+  }
+}

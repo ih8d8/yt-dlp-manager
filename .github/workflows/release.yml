@@ -1,0 +1,637 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: read
+
+# Keyed by the tag being released, not by the triggering ref: a manual run and
+# the tag push for the same version otherwise land in different groups and
+# publish the same version twice, concurrently.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Where the container image is published. ghcr.io/<owner>/<repo>, lowercased
+  # because registries reject capitals in a repository name.
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  # The tag being released. On a tag push this is the tag; on a manual run it
+  # is the required `tag` input. Using github.ref_name alone made a manual run
+  # from main build artifacts called "main", produce no semver image tags, and
+  # try to create a release named "main".
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  # A release names a ref that everything downstream is built from, and the
+  # manual `tag` input is free text. Without this job "main" (or any other
+  # mutable branch, or a tag pushed from an unreviewed one) could be released as
+  # though it were a version, and re-running an older tag would drag :latest,
+  # :MAJOR and :MAJOR.MINOR backwards onto superseded code.
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      publish_latest: ${{ steps.check.outputs.publish_latest }}
+      publish_major: ${{ steps.check.outputs.publish_major }}
+      publish_minor: ${{ steps.check.outputs.publish_minor }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: The release ref must be an immutable semver tag on the default branch
+        id: check
+        env:
+          # Through the environment, never interpolated into the script body:
+          # the input is user-supplied text.
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$RELEASE_TAG" |
+              grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "::error::'$RELEASE_TAG' is not a vMAJOR.MINOR.PATCH[-prerelease] tag" >&2
+            exit 1
+          fi
+          if ! tag_commit=$(git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}"); then
+            echo "::error::'$RELEASE_TAG' is not an existing tag in this repository" >&2
+            exit 1
+          fi
+          # A tag can be pushed from anywhere, including a branch that never
+          # passed review. Releases come from the protected default branch.
+          # Explicit refspec: the remote-tracking ref is written even when the
+          # checkout was configured to fetch only the tag being released.
+          git fetch --quiet origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor "$tag_commit" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::${RELEASE_TAG} (${tag_commit}) is not an ancestor of origin/${DEFAULT_BRANCH}" >&2
+            exit 1
+          fi
+
+          # Floating tags (:latest, :MAJOR, :MAJOR.MINOR) may only ever move
+          # forward. Each is decided against the newest stable tag in its own
+          # series, so a patch on an older line still updates that line's tags
+          # without dragging :latest backwards, and a re-run of a superseded
+          # tag moves nothing at all.
+          stable=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)
+          newest_in() { # $1 = extended regex selecting one release series
+            printf '%s\n' "$stable" | { grep -E "$1" || true; } | sort -V | tail -n 1
+          }
+          latest=false; major=false; minor=false; prerelease=false
+          case "$RELEASE_TAG" in
+            *-*) prerelease=true ;; # a prerelease never owns a floating tag
+            *)
+              maj=${RELEASE_TAG%%.*}   # v1
+              majmin=${RELEASE_TAG%.*} # v1.2
+              if [ "$RELEASE_TAG" = "$(newest_in '.')" ]; then latest=true; fi
+              if [ "$RELEASE_TAG" = "$(newest_in "^${maj}\\.")" ]; then major=true; fi
+              if [ "$RELEASE_TAG" = "$(newest_in "^${majmin//./\\.}\\.")" ]; then minor=true; fi
+              ;;
+          esac
+          {
+            echo "publish_latest=$latest"
+            echo "publish_major=$major"
+            echo "publish_minor=$minor"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing $RELEASE_TAG — prerelease=$prerelease :latest=$latest :MAJOR=$major :MAJOR.MINOR=$minor"
+
+  # Never publish something that does not pass its own test suite.
+  verify:
+    name: Verify
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: |
+            internal/webui/frontend/package-lock.json
+            e2e/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: internal/webui/frontend
+      - run: npm run typecheck && npm test
+        working-directory: internal/webui/frontend
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+      # The same vulnerability gates CI applies to main. A tag is not covered by
+      # a CI run on an older commit, and a release is exactly when shipping a
+      # known-vulnerable dependency matters most.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: Frontend npm audit
+        run: npm audit --audit-level=high
+        working-directory: internal/webui/frontend
+
+      - name: Browser-test npm audit
+        run: npm audit --audit-level=high
+        working-directory: e2e
+
+      # The same container-level checks CI runs. A release publishes an image
+      # and the compose files that point at it, so "CI covered it" is only true
+      # if the release path covers it too.
+      - name: Entrypoint shell check
+        run: |
+          sh -n docker-entrypoint.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck docker-entrypoint.sh
+
+      - name: Compose files are valid
+        run: |
+          docker compose -f compose.yaml config >/dev/null
+          docker compose -f compose-prod.yaml config >/dev/null
+
+      - name: Alpine label matches the base image it is built from
+        run: |
+          set -euo pipefail
+          arg=$(sed -n 's/^ARG ALPINE_VERSION=\(.*\)$/\1/p' Dockerfile)
+          from=$(sed -n 's/^FROM alpine:\([^@ ]*\).*/\1/p' Dockerfile)
+          if [ -z "$arg" ] || [ -z "$from" ]; then
+            echo "could not read both values" >&2
+            exit 1
+          fi
+          if [ "$arg" != "$from" ]; then
+            echo "::error file=Dockerfile::ARG ALPINE_VERSION=$arg but the runtime stage builds FROM alpine:$from" >&2
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: yt-dlp-manager:release-check
+          build-args: |
+            APP_VERSION=${{ env.RELEASE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan runtime image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: yt-dlp-manager:release-check
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore.yaml
+          exit-code: '1'
+
+      # Publishing an image that does not start is the failure this catches:
+      # run it exactly as the compose files do and require a ready answer.
+      - name: Smoke test the image
+        run: |
+          set -eu
+          mkdir -p /tmp/dl /tmp/cfg /tmp/st && chmod 777 /tmp/dl /tmp/cfg /tmp/st
+          docker run -d --name smoke -p 127.0.0.1:8080:8080 \
+            -e "PUID=$(id -u)" -e "PGID=$(id -g)" \
+            -e YTDLP_MANAGER_LISTEN=0.0.0.0:8080 \
+            -v /tmp/dl:/downloads -v /tmp/cfg:/config -v /tmp/st:/state \
+            --read-only --tmpfs /tmp:size=128m,mode=1777,noexec,nosuid,nodev \
+            --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add SETUID --cap-add SETGID \
+            --security-opt no-new-privileges:true yt-dlp-manager:release-check
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8080/healthz
+          curl -fsS http://127.0.0.1:8080/readyz
+
+          caps=$(docker exec smoke sh -c 'grep ^CapEff /proc/1/status' | awk '{print $2}')
+          test "$caps" = "0000000000000000" || { echo "app has capabilities: $caps"; exit 1; }
+          uid=$(docker exec smoke sh -c 'awk "/^Uid:/{print \$2}" /proc/1/status')
+          test "$uid" != "0" || { echo "app is running as root"; exit 1; }
+
+          docker logs smoke
+          docker rm -f smoke
+
+  binaries:
+    name: Binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: arm, goarm: '7' }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: internal/webui/frontend/package-lock.json
+
+      # Build the web UI from source rather than trusting the committed
+      # snapshot: a release must embed the UI that matches this tag.
+      - name: Build web UI
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+        working-directory: internal/webui/frontend
+
+      - name: Build
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -eu
+          VERSION="${RELEASE_TAG}"
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Not GITHUB_SHA: on a manual run that is the dispatch ref's commit
+          # (usually main), while checkout above pinned the tree to the tag.
+          COMMIT=$(git rev-parse HEAD)
+          NAME="yt-dlp-manager_${VERSION}_${GOOS}_${GOARCH}${GOARM:+v$GOARM}"
+          mkdir -p dist
+          # Published as a bare executable, not an archive: one click, one
+          # chmod, no unpacking step.
+          go build -trimpath \
+            -ldflags="-s -w \
+              -X yt-dlp-manager/internal/app.Version=${VERSION} \
+              -X yt-dlp-manager/internal/app.Commit=${COMMIT} \
+              -X yt-dlp-manager/internal/app.Date=${DATE}" \
+            -o "dist/${NAME}" ./cmd/yt-dlp-manager
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: dist/*
+          retention-days: 1
+
+  # Each architecture is built separately and pushed by digest, then stitched
+  # into one manifest list below.
+  #
+  # Each architecture builds on its own native runner. GitHub's hosted arm64
+  # runners are free for public repositories, which this one is, so nothing
+  # here is emulated: the arm64 job went from roughly 20 minutes under QEMU to
+  # about two.
+  #
+  # If this repository is ever made private again, hosted arm64 stops being
+  # free — set the arm64 runner back to `ubuntu-latest` with `qemu: true`, and
+  # the QEMU step below re-arms itself off that flag.
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest,   platform: linux/amd64, qemu: false }
+          - { arch: arm64, runner: ubuntu-24.04-arm, platform: linux/arm64, qemu: false }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Without this the image's binary reports "built unknown", unlike the
+      # released binaries, which stamp a real date. The commit comes from the
+      # checked-out tree rather than github.sha, which on a manual run names
+      # the dispatch ref instead of the tag actually being built.
+      - name: Stamp the build date and commit
+        run: |
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            APP_VERSION=${{ env.RELEASE_TAG }}
+            APP_COMMIT=${{ env.BUILD_SHA }}
+            APP_DATE=${{ env.BUILD_DATE }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # Attestations would add extra manifest entries that push-by-digest
+          # and `imagetools create` then try to treat as architectures.
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      # The digest output carries a "sha256:" prefix. Strip it: the filename is
+      # later interpolated into "IMAGE@sha256:%s", so keeping it would build
+      # "IMAGE@sha256:sha256:..." — an invalid reference — and a ":" in an
+      # artifact filename is rejected by upload-artifact besides.
+      - name: Export digest
+        env:
+          # Through the environment rather than pasted into the script body, so
+          # the value can never be read as shell source. Same rule as the
+          # yt-dlp updater; harmless here today, but the habit is the point.
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        shell: bash
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # needs draft (and so binaries) as well as image: this job is what moves the
+  # floating tags (:latest, :1, :1.2) onto the new digests. Running it earlier
+  # could leave a published, half-finished release — a new image under :latest
+  # with no downloadable binaries and no GitHub release to go with it.
+  manifest:
+    name: Image manifest
+    needs: [validate, image, draft]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # latest=false is load-bearing. In the default "auto" mode this action
+          # emits :latest itself for any stable semver pattern, so gating only
+          # the explicit raw rule below would still have let a re-run of an
+          # older tag move :latest backwards onto superseded code.
+          flavor: |
+            latest=false
+          # v1.2.3 -> :1.2.3 always (immutable), plus the floating tags this
+          # release is actually allowed to advance.
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }},enable=${{ needs.validate.outputs.publish_minor == 'true' }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }},enable=${{ needs.validate.outputs.publish_major == 'true' }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.publish_latest == 'true' }}
+
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          # Built as arrays rather than by splitting a string: a tag is
+          # attacker-influenced only through the release tag, but relying on
+          # word splitting also meant the image name was a printf FORMAT
+          # string, so a '%' anywhere in it would have been interpreted.
+          tags=()
+          while IFS= read -r t; do
+            [ -n "$t" ] && tags+=(-t "$t")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          if [ ${#tags[@]} -eq 0 ]; then
+            echo "::error::metadata action produced no tags" >&2
+            exit 1
+          fi
+          # One file per architecture, each named for its image digest.
+          digests=()
+          for d in *; do
+            [ -f "$d" ] && digests+=("$IMAGE_NAME@sha256:$d")
+          done
+          if [ ${#digests[@]} -eq 0 ]; then
+            echo "::error::no per-architecture digests to combine" >&2
+            exit 1
+          fi
+          docker buildx imagetools create "${tags[@]}" "${digests[@]}"
+
+      - name: Inspect the published image
+        id: published
+        env:
+          META_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          docker buildx imagetools inspect "$IMAGE_NAME:$META_VERSION"
+          # The manifest list's own digest, which is what consumers pull and
+          # what the attestation below has to be bound to.
+          digest=$(docker buildx imagetools inspect "$IMAGE_NAME:$META_VERSION" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # Signed provenance for the published manifest, stored in the registry
+      # alongside it: `gh attestation verify oci://IMAGE:TAG --repo OWNER/REPO`
+      # then proves which workflow and commit built it. This is the GitHub
+      # attestation path rather than BuildKit's, whose extra manifest entries
+      # are what push-by-digest and `imagetools create` cannot handle.
+      #
+      # Skipped while the repository is private: on Free/Pro/Team plans artifact
+      # attestations are a public-repository feature, and the API call fails
+      # rather than degrading. It starts working by itself once this repository
+      # is public — the same condition as the arm64 runner note above.
+      - name: Attest the published image
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.published.outputs.digest }}
+          push-to-registry: true
+
+  # Created as a draft, before any floating image tag moves. Everything a user
+  # downloads is attached and verifiable at this point; `finalize` only flips
+  # the visibility once the image manifest is actually published.
+  draft:
+    name: Draft release
+    needs: [validate, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -eu
+          cd artifacts
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          ls -la
+
+      # A checksum file says the download matches itself; an attestation says
+      # which workflow, repository and commit produced it, and is verifiable
+      # with `gh attestation verify <file> --repo <owner>/<repo>`. Public
+      # repositories only on Free/Pro/Team plans — see the image attestation.
+      - name: Attest the binaries
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/yt-dlp-manager_*
+
+      # Re-running a release that is already public must not take it offline
+      # for the length of the run, so only a release that does not exist yet
+      # (or is still a draft) is written as a draft here.
+      - name: Is this release already published?
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -eu
+          draft=true
+          if state=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$state" = "false" ]; then draft=false; fi
+          fi
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "creating release as draft=$draft"
+
+      - name: Create the draft GitHub release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: ${{ steps.existing.outputs.draft }}
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: artifacts/*
+          body: |
+            ## Container image
+
+            ```bash
+            docker pull ${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+            ```
+
+            Published as a multi-architecture manifest for `linux/amd64` and
+            `linux/arm64`. `compose-prod.yaml` in the repository runs this image
+            directly and builds nothing.
+
+            ## Binaries
+
+            Download the executable for your platform, verify it against
+            `SHA256SUMS`, then make it executable and put it on your `PATH`:
+
+            ```bash
+            sha256sum -c SHA256SUMS --ignore-missing
+            chmod +x yt-dlp-manager_${{ env.RELEASE_TAG }}_linux_amd64
+            ```
+
+            Releases built from the public repository also carry GitHub build
+            provenance, which says where an artifact came from rather than only
+            that it matches its own checksum:
+
+            ```bash
+            gh attestation verify yt-dlp-manager_${{ env.RELEASE_TAG }}_linux_amd64 --repo ${{ github.repository }}
+            gh attestation verify oci://${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }} --repo ${{ github.repository }}
+            ```
+
+            The binary needs `yt-dlp` and `ffmpeg` on `PATH`, plus a JavaScript
+            runtime (`deno`, `node`, `qjs` or `bun`) for YouTube. Windows is not
+            supported — the download supervisor relies on POSIX process groups.
+
+  # The last step of the release: the draft becomes visible only once the image
+  # manifest is published, so the announcement and the artifacts it points at
+  # always exist together. "Latest release" on GitHub follows the same
+  # forward-only rule as the :latest image tag.
+  finalize:
+    name: Publish release
+    needs: [validate, draft, manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Undraft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          MARK_LATEST: ${{ needs.validate.outputs.publish_latest }}
+          MARK_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          set -eu
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$MARK_LATEST" --prerelease="$MARK_PRERELEASE"
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,url
+          # "Latest release" is a repository-level pointer, not a field on the
+          # release itself (gh release view has no isLatest), so it is read from
+          # the API — and only reported: the release is already public by here,
+          # and failing the job would not un-publish anything.
+          if [ "$MARK_LATEST" = "true" ]; then
+            latest=$(gh api "repos/${GH_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+            if [ "$latest" != "$RELEASE_TAG" ]; then
+              echo "::warning::GitHub reports ${latest:-none} as the latest release, not ${RELEASE_TAG}"
+            fi
+          fi

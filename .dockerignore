@@ -1,0 +1,20 @@
+# .dockerignore - keep build context small and secrets out of images
+.git
+.gitignore
+bin/
+assets/
+*.md
+!internal/webui/static/**
+compose.yaml
+Dockerfile
+.dockerignore
+password.txt
+password.txt.*
+.env
+.env.*
+*.secret*
+*.key
+**/node_modules/
+downloads/
+config/
+state/

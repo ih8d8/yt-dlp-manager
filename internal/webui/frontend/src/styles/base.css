@@ -1,0 +1,66 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100%;
+}
+
+html {
+  /* Painted from a token so overscroll and the pre-paint flash follow the
+     theme instead of showing a hardcoded dark slab behind a light UI. */
+  background: var(--bg);
+}
+
+body {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.45;
+  background: var(--app-bg);
+  background-attachment: fixed;
+  color: var(--text);
+}
+
+[data-theme='light'] body,
+[data-theme='system'] body {
+  background: var(--bg);
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--active-blue);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+a {
+  color: var(--accent);
+}
+
+button,
+input,
+select,
+textarea {
+  accent-color: var(--active-blue);
+}
