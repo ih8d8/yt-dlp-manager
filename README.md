@@ -115,6 +115,10 @@ overridden by `YTDLP_MANAGER_*` environment variables, then CLI flags. State is
 `$XDG_STATE_HOME/yt-dlp-manager/state.json`, socket
 `$XDG_RUNTIME_DIR/yt-dlp-manager.sock`.
 
+## Credits
+
+AI disclosure: This project was created with the help of OX Alpha, GPT Sol 5.6, and Claude Opus 5.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
