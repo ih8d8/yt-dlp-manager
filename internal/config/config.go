@@ -1,7 +1,8 @@
 // Package config owns the manager application configuration: a versioned,
 // bounded, atomically persisted JSON file plus environment/flag resolution.
-// It is deliberately separate from yt-dlp's own configuration, which always
-// stays authoritative for download choices.
+// It is deliberately separate from yt-dlp's own configuration, which stays
+// authoritative for every download choice a single item did not override
+// through ipc.Options.
 package config
 
 import (
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"yt-dlp-manager/internal/ipc"
 )
 
 const CurrentVersion = 1
@@ -27,6 +30,10 @@ type ServerSection struct {
 
 type DownloadsSection struct {
 	MaxConcurrent int `json:"max_concurrent"`
+	// ExtraArgs is free-form yt-dlp command line text appended to every
+	// download. It is stored as typed and parsed at use; ipc.ExtraArgs
+	// defines what it may contain. Empty by default.
+	ExtraArgs string `json:"extra_args,omitempty"`
 }
 
 type UISection struct {
@@ -91,6 +98,12 @@ func Validate(f *File) error {
 		return fmt.Errorf("downloads.max_concurrent must be between %d and %d, got %d",
 			MinConcurrent, MaxConcurrent, f.Downloads.MaxConcurrent)
 	}
+	// Extra arguments are re-validated on the way in, not only when they were
+	// entered: a config file edited by hand is just as much an entry point as
+	// the settings API, and these become command line arguments either way.
+	if _, err := ipc.ExtraArgs(f.Downloads.ExtraArgs); err != nil {
+		return fmt.Errorf("downloads.extra_args: %w", err)
+	}
 	switch f.UI.Theme {
 	case "dark", "light", "system":
 	default:
@@ -136,6 +149,7 @@ type Resolved struct {
 func Resolve(path string) (*Resolved, error) {
 	f := Defaults()
 	sources := map[string]Source{
+		"downloads.extra_args":         SourceDefault,
 		"server.listen":                SourceDefault,
 		"server.allow_unauthenticated": SourceDefault,
 		"server.secure_cookie":         SourceDefault,
@@ -168,6 +182,10 @@ func Resolve(path string) (*Resolved, error) {
 		if present["downloads.max_concurrent"] {
 			f.Downloads.MaxConcurrent = fv.Downloads.MaxConcurrent
 			sources["downloads.max_concurrent"] = SourceFile
+		}
+		if present["downloads.extra_args"] {
+			f.Downloads.ExtraArgs = fv.Downloads.ExtraArgs
+			sources["downloads.extra_args"] = SourceFile
 		}
 		if present["ui.theme"] {
 			f.UI.Theme = fv.UI.Theme

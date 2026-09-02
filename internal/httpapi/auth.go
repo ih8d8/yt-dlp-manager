@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,25 +273,58 @@ func ephemeralSessionKey() []byte {
 
 const sessionKeyBytes = 32
 
+// A valid key file is 65 bytes including its newline. Keep corrupt files from
+// turning startup into an unbounded allocation before they are rotated.
+const maxSessionKeyFileBytes = 4 << 10
+
+var errSessionKeyFileTooLarge = errors.New("session key file is too large")
+
+func readSessionKeyFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSessionKeyFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxSessionKeyFileBytes {
+		return nil, errSessionKeyFileTooLarge
+	}
+	return data, nil
+}
+
 // LoadOrCreateKey reads the hex-encoded session signing key at path or
 // generates and persists one atomically with 0600 permissions.
 func LoadOrCreateKey(path string) ([]byte, error) {
 	// Same check the credential file beside it already gets: a symlink or a
 	// non-regular file here would let another process choose where the signing
 	// key is read from or written to.
-	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
-		return nil, errors.New("session key path must be a regular file")
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	var existing os.FileInfo
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("session key path must be a regular file")
+		}
+		existing = info
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect session key: %w", err)
 	}
-	if data, err := os.ReadFile(path); err == nil {
+	if existing != nil && existing.Size() <= maxSessionKeyFileBytes {
+		data, err := readSessionKeyFile(path)
+		if err != nil {
+			// A file replaced with an oversized one between Lstat and Open is
+			// still bounded by readSessionKeyFile and handled like any other
+			// corrupt key: atomically rotate it below.
+			if !errors.Is(err, errSessionKeyFileTooLarge) {
+				return nil, fmt.Errorf("read session key: %w", err)
+			}
+		}
 		key, derr := hex.DecodeString(strings.TrimSpace(string(data)))
 		if derr == nil && len(key) == sessionKeyBytes {
 			return key, nil
 		}
 		// Fall through and rotate an unreadable/short key rather than fail.
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read session key: %w", err)
 	}
 	b := make([]byte, sessionKeyBytes)
 	if _, err := rand.Read(b); err != nil {
@@ -352,8 +386,24 @@ const (
 	minPasswordRunes = 8
 	maxPasswordBytes = 1024
 
-	loginBaseDelay   = 500 * time.Millisecond
-	loginMaxDelay    = 15 * time.Minute
+	loginBaseDelay = 500 * time.Millisecond
+	// loginMaxDelay caps the per-client backoff. It is deliberately short.
+	//
+	// This is a single-admin, self-hosted application, and a long lockout
+	// punishes the wrong person. The operator who half-remembers their own
+	// password and tries a dozen variants is far more common than an attacker,
+	// and at the previous fifteen-minute ceiling that operator was shut out of
+	// their own server for a quarter of an hour. It also made the shared
+	// bucket behind a reverse proxy (see clientip.go) an outright denial of
+	// service rather than a nuisance.
+	//
+	// What actually makes guessing infeasible is the password itself and the
+	// 210k-iteration PBKDF2 verification behind it, not the length of the
+	// pause: a minute between attempts already reduces an attacker to ~1440
+	// guesses a day, which no password worth accepting falls to. Stretching
+	// that to fifteen minutes buys almost nothing and costs the operator a
+	// great deal.
+	loginMaxDelay    = 60 * time.Second
 	maxTrackedClient = 1024
 
 	// Service-wide backoff kicks in past this many failures inside the window,
@@ -512,7 +562,8 @@ func (l *loginLimiter) noteGlobalFailureLocked() {
 	// bounded by per-client exponential backoff and a 210k-iteration PBKDF2
 	// verification; this only has to stop address rotation from making
 	// guessing free, and a hard cap keeps it from becoming a denial of
-	// service against the legitimate administrator.
+	// service against the legitimate administrator. Same reasoning as
+	// loginMaxDelay, which is why the two ceilings are the same order.
 	if limit := now.Add(globalMaxDelay); next.After(limit) {
 		next = limit
 	}

@@ -146,6 +146,10 @@ function DownloadsTab({
   pushToast: (m: string, ok?: boolean) => void
 }) {
   const [maxC, setMaxC] = useState(String(view.downloads.max_concurrent))
+  const [extraArgs, setExtraArgs] = useState(view.downloads.extra_args ?? '')
+  const [extraArgsError, setExtraArgsError] = useState<string | null>(null)
+  const [savingArgs, setSavingArgs] = useState(false)
+  const dirtyArgs = extraArgs !== (view.downloads.extra_args ?? '')
   const [ytdlp, setYtdlp] = useState<YtDlpSettingsResponse | null>(null)
   const [form, setForm] = useState<YtDlpSettings>({})
   const dirtyMax = Number(maxC) !== view.downloads.max_concurrent
@@ -168,6 +172,23 @@ function DownloadsTab({
       pushToast('concurrency updated; active downloads are unaffected', true)
     } catch (e) {
       pushToast(e instanceof Error ? e.message : 'save failed')
+    }
+  }
+
+  const saveExtraArgs = async () => {
+    setSavingArgs(true)
+    setExtraArgsError(null)
+    try {
+      const v = await api.saveSettings({ downloads: { extra_args: extraArgs.trim() } })
+      onSaved(v)
+      setExtraArgs(v.downloads.extra_args ?? '')
+      pushToast('extra arguments saved; new downloads use them', true)
+    } catch (e) {
+      // The server names the option it refused, so it is shown at the field
+      // rather than as a toast that disappears before it can be acted on.
+      setExtraArgsError(e instanceof Error ? e.message : 'save failed')
+    } finally {
+      setSavingArgs(false)
     }
   }
 
@@ -288,6 +309,57 @@ function DownloadsTab({
             </div>
           </div>
         )}
+
+        <div class="subsection">
+          <h4>Extra arguments</h4>
+          <p class="hint">
+            Added to the command line of <strong>every</strong> download, after
+            your yt-dlp config, so these win over it. They are defaults: a
+            single download's own options and extra arguments come later still
+            and override these. Written as you would type them on a command
+            line — quotes are honoured, nothing else is: no shell runs, so{' '}
+            <code class="kv">$(…)</code> and <code class="kv">*</code> stay
+            literal text. Empty by default. Saved separately from the block
+            above, in the manager's own configuration, so this field stays
+            editable either way.
+          </p>
+          <textarea
+            id="extra-args"
+            class="input input-code"
+            rows={2}
+            spellcheck={false}
+            placeholder="--limit-rate 2M --retries 20"
+            value={extraArgs}
+            onInput={(e) => {
+              setExtraArgs((e.target as HTMLTextAreaElement).value)
+              setExtraArgsError(null)
+            }}
+          />
+          {extraArgsError && (
+            <p class="field-error" role="alert">
+              {extraArgsError}
+            </p>
+          )}
+          <p class="hint">
+            Only a fixed list of ordinary download options is accepted — rate
+            limits, retries, proxies, headers, format sorting, subtitles,
+            SponsorBlock and similar — spelled in full, since yt-dlp also
+            accepts abbreviations. Anything else is refused by name, including
+            options that run programs, load code, choose paths, or carry a
+            password. Put those in your yt-dlp config file, which the manager
+            never overrides. Avoid secrets here: this text is stored with the
+            download and returned by the API.
+          </p>
+          <div class="dialog-actions">
+            <button
+              class="btn primary"
+              disabled={!dirtyArgs || savingArgs}
+              onClick={() => void saveExtraArgs()}
+            >
+              {savingArgs ? 'Saving…' : 'Save extra arguments'}
+            </button>
+          </div>
+        </div>
       </section>
     </>
   )
@@ -435,7 +507,11 @@ function AdvancedTab({ view, system }: { view: SettingsView; system: SystemInfo 
         <span>Config editing feature</span>
         <span>{view.advanced.allow_yt_dlp_config_edit ? 'enabled' : 'disabled'}</span>
       </div>
-      <p class="hint">The standard yt-dlp configuration remains authoritative for all download options.</p>
+      <p class="hint">
+        The standard yt-dlp configuration decides every download option, except
+        where a single download overrides it through the queue's “Add with
+        options” picker.
+      </p>
       <p class="hint">Uptime: {system?.runtime.uptime_human ?? '…'}</p>
     </section>
   )

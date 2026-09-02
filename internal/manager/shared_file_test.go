@@ -76,11 +76,12 @@ func TestRemoveSparesSharedPartialOfSurvivingItem(t *testing.T) {
 // so tests can control which files an item claims.
 type sharedFileRunner struct{ dir string }
 
-func (f sharedFileRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (f sharedFileRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	return []Entry{{URL: url, Title: "t"}}, nil
 }
 
-func (f sharedFileRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f sharedFileRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
 	onLine(PrintLine("@g|", filepath.Join(f.dir, "ignored.bin")))
 	return "", nil
 }

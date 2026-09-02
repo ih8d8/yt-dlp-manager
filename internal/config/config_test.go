@@ -660,3 +660,61 @@ func TestManagedBlockConcurrentWritesStayConsistent(t *testing.T) {
 		t.Errorf("post-concurrency status problem: %s", status.Problem)
 	}
 }
+
+// TestSavedConfigLoadsBackWithEveryField is the regression test for a field
+// that could be written but not read: the loader enumerates known keys by
+// hand, so a new field added to the struct alone makes the next start
+// quarantine the whole configuration file and lose every setting in it.
+func TestSavedConfigLoadsBackWithEveryField(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(filepath.Join(dir, "config.json"))
+
+	saved := Defaults()
+	saved.Downloads.MaxConcurrent = 7
+	saved.Downloads.ExtraArgs = "--limit-rate 2M --retries 20"
+	saved.UI.Theme = "light"
+	saved.UI.Compact = true
+	saved.Server.Listen = "127.0.0.1:9999"
+	saved.Server.AllowUnauthenticated = true
+	saved.Server.SecureCookie = true
+	saved.Advanced.AllowYtDlpConfigEdit = true
+	if err := store.Save(&saved); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("a config this build just wrote was rejected on load: %v", err)
+	}
+	if loaded.File != saved {
+		t.Errorf("round trip lost data:\n saved  %+v\n loaded %+v", saved, loaded.File)
+	}
+	if !loaded.Present["downloads.extra_args"] {
+		t.Error("extra_args loaded but not recorded as present")
+	}
+}
+
+// TestResolveAppliesSavedExtraArgs is the regression test for global arguments
+// that saved correctly and then vanished on the next start: Resolve, not
+// Store.Load, is what startup actually uses, and it copied each field by hand.
+func TestResolveAppliesSavedExtraArgs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	saved := Defaults()
+	saved.Downloads.ExtraArgs = "--limit-rate 2M"
+	saved.Downloads.MaxConcurrent = 9
+	if err := NewStore(path).Save(&saved); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := Resolve(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.File.Downloads.ExtraArgs != "--limit-rate 2M" {
+		t.Errorf("extra_args = %q, want the saved value", resolved.File.Downloads.ExtraArgs)
+	}
+	if resolved.Sources["downloads.extra_args"] != SourceFile {
+		t.Errorf("source = %q, want file", resolved.Sources["downloads.extra_args"])
+	}
+}

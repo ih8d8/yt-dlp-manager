@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -93,30 +94,35 @@ func TestClampMaxBoundsConcurrency(t *testing.T) {
 
 // Load refuses oversized state, so Save must too — otherwise the next start
 // quarantines the file and the whole history disappears.
-func TestSaveRefusesStateLargerThanLoadAccepts(t *testing.T) {
+// TestSaveAlwaysProducesALoadableFile: Save must never write something the
+// next start would quarantine as corrupt. It used to guarantee this by
+// refusing; it now guarantees it by trimming the oldest finished history, so
+// the property under test is the same and the outcome is better.
+func TestSaveAlwaysProducesALoadableFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 	st, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	huge := strings.Repeat("t", 1<<20)
+	const chunk = 4 << 20
+	huge := strings.Repeat("t", chunk)
+	rows := maxStateBytes/chunk + 2
 	var items []ipc.Item
 	var order []string
-	for i := 0; i < 80; i++ {
-		id := string(rune('a'+i%26)) + strings.Repeat("0", 7)
+	for i := 0; i < rows; i++ {
+		id := fmt.Sprintf("%08x", i)
 		items = append(items, ipc.Item{
 			ID: id, URL: "https://example.com/x", Title: huge,
 			State: ipc.StateCompleted, AddedAt: time.Now(),
 		})
 		order = append(order, id)
 	}
-	err = st.Save(items, order)
-	if err == nil {
-		t.Fatal("Save accepted a snapshot that Load will reject")
+	if _, err := st.SaveTrimmed(items, order); err != nil {
+		t.Fatalf("Save failed instead of trimming: %v", err)
 	}
-	if !strings.Contains(err.Error(), "limit") {
-		t.Fatalf("unhelpful error: %v", err)
+	if _, err := st.Load(); err != nil {
+		t.Fatalf("Save wrote a file Load rejects: %v", err)
 	}
 }
 

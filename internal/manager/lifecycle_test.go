@@ -30,6 +30,18 @@ func TestFreshIDNeverCollidesUnderVolume(t *testing.T) {
 	}
 }
 
+func TestNewIDHasLongLivedEntropy(t *testing.T) {
+	id, err := newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sixteen random bytes, hex encoded. This pins the lifetime-collision
+	// guarantee separately from freshIDLocked's live-row collision retry.
+	if len(id) != 32 {
+		t.Fatalf("newID length = %d, want 32: %q", len(id), id)
+	}
+}
+
 func TestAddSurfacesRandomIDFailure(t *testing.T) {
 	old := randomRead
 	randomRead = func([]byte) (int, error) { return 0, context.Canceled }
@@ -154,7 +166,8 @@ func (r *slotCountingRunner) leave() {
 	r.mu.Unlock()
 }
 
-func (r *slotCountingRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (r *slotCountingRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	r.enter()
 	r.mu.Lock()
 	r.probes++
@@ -168,7 +181,7 @@ func (r *slotCountingRunner) Probe(ctx context.Context, url string) ([]Entry, er
 	}
 }
 
-func (r *slotCountingRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (r *slotCountingRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
 	r.enter()
 	defer r.leave()
 	return "", nil
@@ -255,7 +268,7 @@ func TestScheduleDoesNotStartAfterCancel(t *testing.T) {
 
 	cancel() // simulate shutdown before A finishes
 
-	fr.releaseURL("https://v/a")
+	fr.releaseURL(t, "https://v/a")
 	waitFor(t, time.Second, func() bool {
 		it, _ := m.Get(idA)
 		return it.State == ipc.StatePaused // shutdown downgrade

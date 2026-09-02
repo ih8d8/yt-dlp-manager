@@ -9,6 +9,7 @@ import {
   hasKnownTotal,
   progressLabelText,
   progressTrackMode,
+  summarizeBulkClear,
   summarizeBulkRetry
 } from '../src/format'
 import { initialState, queueOrder, reduce } from '../src/state/downloads'
@@ -258,5 +259,38 @@ describe('summarizeBulkRetry', () => {
 
   it('falls back to a generic reason when the server sent none', () => {
     expect(summarizeBulkRetry(1, [{ ok: false }], null).message).toBe('action failed')
+  })
+})
+
+describe('summarizeBulkClear', () => {
+  it('reports what was cleared', () => {
+    const r = summarizeBulkClear(3, [{ ok: true }, { ok: true }, { ok: true }], null)
+    expect(r).toEqual({ message: 'Cleared 3 entries', ok: true })
+  })
+
+  it('uses the singular for one entry', () => {
+    expect(summarizeBulkClear(1, [{ ok: true }], null).message).toBe('Cleared 1 entry')
+  })
+
+  // A later chunk failing must not hide the rows earlier chunks already
+  // removed, or the user goes looking for entries that are already gone.
+  it('still counts what earlier chunks removed when a later one fails', () => {
+    const r = summarizeBulkClear(900, [{ ok: true }, { ok: true }], 'network error')
+    expect(r.ok).toBe(false)
+    expect(r.message).toBe('Cleared 2 of 900; the rest failed: network error')
+  })
+
+  it('surfaces a per-id failure reason', () => {
+    const r = summarizeBulkClear(
+      2,
+      [{ ok: true }, { ok: false, error: { message: 'no such download' } }],
+      null
+    )
+    expect(r.ok).toBe(false)
+    expect(r.message).toBe('Cleared 1 of 2; no such download')
+  })
+
+  it('reports the bare error when nothing was cleared', () => {
+    expect(summarizeBulkClear(5, [], 'offline').message).toBe('offline')
   })
 })

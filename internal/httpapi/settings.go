@@ -3,8 +3,10 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"yt-dlp-manager/internal/config"
+	"yt-dlp-manager/internal/ipc"
 )
 
 type settingsView struct {
@@ -15,6 +17,8 @@ type settingsView struct {
 	Downloads struct {
 		MaxConcurrent int    `json:"max_concurrent"`
 		Source        string `json:"source"`
+		// ExtraArgs is yt-dlp command line text appended to every download.
+		ExtraArgs string `json:"extra_args"`
 	} `json:"downloads"`
 	Security struct {
 		AuthenticationEnabled bool   `json:"authentication_enabled"`
@@ -40,6 +44,7 @@ func (s *Server) buildSettingsViewLocked() settingsView {
 	v.UI.Theme = f.UI.Theme
 	v.UI.Compact = f.UI.Compact
 	v.Downloads.MaxConcurrent = f.Downloads.MaxConcurrent
+	v.Downloads.ExtraArgs = f.Downloads.ExtraArgs
 	if s.deps.Sources != nil {
 		if src, ok := s.deps.Sources["downloads.max_concurrent"]; ok {
 			v.Downloads.Source = string(src)
@@ -77,7 +82,8 @@ type settingsUpdateRequest struct {
 		Compact *bool   `json:"compact,omitempty"`
 	} `json:"ui"`
 	Downloads struct {
-		MaxConcurrent *int `json:"max_concurrent,omitempty"`
+		MaxConcurrent *int    `json:"max_concurrent,omitempty"`
+		ExtraArgs     *string `json:"extra_args,omitempty"`
 	} `json:"downloads"`
 }
 
@@ -118,6 +124,16 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		updated.Downloads.MaxConcurrent = n
 		changed = true
 	}
+	if req.Downloads.ExtraArgs != nil {
+		// Parsed and checked here so the caller is told exactly which option
+		// was refused, rather than every later download failing.
+		if _, err := ipc.ExtraArgs(*req.Downloads.ExtraArgs); err != nil {
+			writeError(w, r, http.StatusUnprocessableEntity, codeInvalidOptions, err.Error())
+			return
+		}
+		updated.Downloads.ExtraArgs = strings.TrimSpace(*req.Downloads.ExtraArgs)
+		changed = true
+	}
 	if !changed {
 		writeError(w, r, http.StatusUnprocessableEntity, codeInvalidState, "no editable fields supplied")
 		return
@@ -132,25 +148,59 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// persistence fails the runtime change is rolled back so disk, memory,
 	// and the manager never diverge.
 	prevMax := s.deps.Config.Downloads.MaxConcurrent
-	if updated.Downloads.MaxConcurrent != prevMax {
-		if err := s.deps.Manager.SetMaxConcurrent(updated.Downloads.MaxConcurrent); err != nil {
-			writeError(w, r, http.StatusUnprocessableEntity, codeInvalidState,
-				"max_concurrent could not be applied")
+	prevExtra := s.deps.Config.Downloads.ExtraArgs
+
+	// Persist BEFORE touching the running manager. Raising the concurrency cap
+	// immediately releases queued downloads, and a download that has started
+	// cannot be un-started: if persistence then failed, the rollback would be
+	// a lie — jobs would already be running under a configuration the caller
+	// was told had been rejected. Writing first means the only work that ever
+	// starts is work whose settings survived.
+	if s.deps.Store != nil {
+		if err := s.deps.Store.Save(&updated); err != nil && !errors.Is(err, config.ErrNoConfig) {
+			writeError(w, r, http.StatusInternalServerError, codeInternal, "settings could not be persisted")
 			return
 		}
 	}
-	if s.deps.Store != nil {
-		if err := s.deps.Store.Save(&updated); err != nil && !errors.Is(err, config.ErrNoConfig) {
-			if updated.Downloads.MaxConcurrent != prevMax {
-				_ = s.deps.Manager.SetMaxConcurrent(prevMax)
+
+	// Arguments before concurrency: SetMaxConcurrent runs the scheduler, so
+	// anything it releases must already see the new arguments.
+	if updated.Downloads.ExtraArgs != prevExtra {
+		if err := s.deps.Manager.SetExtraArgs(updated.Downloads.ExtraArgs); err != nil {
+			// Validated above, so this is unreachable in practice; put the file
+			// back rather than leave disk describing a state nothing applied.
+			s.restorePersistedSettings(prevMax, prevExtra)
+			writeError(w, r, http.StatusUnprocessableEntity, codeInvalidOptions, err.Error())
+			return
+		}
+	}
+	if updated.Downloads.MaxConcurrent != prevMax {
+		if err := s.deps.Manager.SetMaxConcurrent(updated.Downloads.MaxConcurrent); err != nil {
+			if updated.Downloads.ExtraArgs != prevExtra {
+				_ = s.deps.Manager.SetExtraArgs(prevExtra)
 			}
-			writeError(w, r, http.StatusInternalServerError, codeInternal, "settings could not be persisted")
+			s.restorePersistedSettings(prevMax, prevExtra)
+			writeError(w, r, http.StatusUnprocessableEntity, codeInvalidState,
+				"max_concurrent could not be applied")
 			return
 		}
 	}
 	*s.deps.Config = updated
 	// Lock is already held: use the locked view builder (no re-entry).
 	writeJSON(w, http.StatusOK, s.buildSettingsViewLocked())
+}
+
+// restorePersistedSettings rewrites the two download fields to their previous
+// values after a runtime change could not be applied. Caller must hold
+// s.settingsMu.
+func (s *Server) restorePersistedSettings(prevMax int, prevExtra string) {
+	if s.deps.Store == nil {
+		return
+	}
+	reverted := *s.deps.Config
+	reverted.Downloads.MaxConcurrent = prevMax
+	reverted.Downloads.ExtraArgs = prevExtra
+	_ = s.deps.Store.Save(&reverted)
 }
 
 // --- yt-dlp managed settings ---

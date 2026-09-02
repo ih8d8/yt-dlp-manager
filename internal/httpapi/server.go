@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,12 @@ type Deps struct {
 	SecureCookie         bool
 	Listen               string
 	TrustedHosts         []string
+	// TrustedProxies are the reverse proxies whose X-Forwarded-For chain may
+	// be used to identify a client for login rate limiting. Empty (the
+	// default) means the socket peer is the only identity ever used. It never
+	// affects first-run setup authorization, which reads the accepted socket
+	// on purpose — see clientip.go.
+	TrustedProxies []netip.Prefix
 	// SetupToken is the one-time first-run bootstrap secret, printed to the
 	// server log at startup when the bind can be reached from off-box. Empty
 	// means no remote first-run setup is possible at all (a loopback bind, or

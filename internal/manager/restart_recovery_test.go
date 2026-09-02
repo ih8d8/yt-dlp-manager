@@ -84,10 +84,11 @@ func TestInterruptedMergeDownloadSurvivesRestart(t *testing.T) {
 
 type stubRunner struct{}
 
-func (stubRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (stubRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	return []Entry{{URL: url}}, nil
 }
-func (stubRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (stubRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
 	<-ctx.Done()
 	return "", ctx.Err()
 }

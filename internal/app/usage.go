@@ -34,7 +34,9 @@ a persistent inbox that drains on next launch.
 
 Your existing yt-dlp configuration stays authoritative for download choices:
 format selection, output directory/template, cookies, retries, and the rest.
-Download jobs add only quiet, color-safe, machine-readable output flags.
+Download jobs add only quiet, color-safe, machine-readable output flags —
+plus, for a download added through the web UI's options picker, the specific
+format/container/subtitle choices made for that one item.
 
 Environment:
   YTDLP_MANAGER_MAX_CONCURRENT  default concurrency when no flag is given

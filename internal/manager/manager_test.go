@@ -34,7 +34,8 @@ func newFakeRunner() *fakeRunner {
 	}
 }
 
-func (f *fakeRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (f *fakeRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	f.mu.Lock()
 	fn := f.probeFn
 	f.mu.Unlock()
@@ -44,13 +45,22 @@ func (f *fakeRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
 	return []Entry{{URL: url, Title: "title-" + url}}, nil
 }
 
-func (f *fakeRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f *fakeRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
+	url := job.URL
 	f.mu.Lock()
 	f.runCnt[url]++
 	f.started = append(f.started, url)
 	ch := make(chan struct{})
 	f.release[url] = ch
-	for _, l := range f.lines[url] {
+	lines, configured := f.lines[url]
+	if !configured {
+		// A real successful yt-dlp run always names its output — both for a
+		// fresh download and for one that was already on disk. Modelling that
+		// by default keeps every test that just wants "this finishes" honest,
+		// while a test can still opt into the no-output case with setLines(url).
+		lines = []string{PrintLine("@g|", "/downloads/fake-"+strings.TrimPrefix(url, "https://")+".mp4")}
+	}
+	for _, l := range lines {
 		onLine(l)
 	}
 	f.mu.Unlock()
@@ -69,13 +79,32 @@ func (f *fakeRunner) startedCount() int {
 	return len(f.started)
 }
 
-func (f *fakeRunner) releaseURL(url string) {
-	f.mu.Lock()
-	ch := f.release[url]
-	delete(f.release, url)
-	f.mu.Unlock()
-	if ch != nil {
-		close(ch)
+// releaseURL unblocks a running fake download. It waits for the run to have
+// registered itself rather than assuming it already has: the manager marks an
+// item "downloading" BEFORE calling Run, so a test that waits on the item
+// state can easily arrive first.
+//
+// It fails the test rather than returning quietly if the run never appears. A
+// silent return turns a real problem into a hang that only shows up as a
+// timeout minutes later, on whichever machine happened to be slow.
+func (f *fakeRunner) releaseURL(t *testing.T, url string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f.mu.Lock()
+		ch := f.release[url]
+		if ch != nil {
+			delete(f.release, url)
+		}
+		f.mu.Unlock()
+		if ch != nil {
+			close(ch)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("releaseURL(%q): the fake runner never started this download", url)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -114,6 +143,7 @@ func newTestManager(t *testing.T, max int, r Runner) (*Manager, *Store) {
 		items:  make(map[string]*item),
 		subs:   make(map[chan ipc.Event]struct{}),
 		dirty:  make(chan struct{}, 1),
+		fmtSem: make(chan struct{}, maxConcurrentFormatProbes),
 	}
 	return m, st
 }
@@ -199,7 +229,7 @@ func TestQueueRespectsMaxConcurrent(t *testing.T) {
 		return running == 2 && queued == 2
 	}, "stats settle to (2,2)")
 
-	fr.releaseURL("https://v/0")
+	fr.releaseURL(t, "https://v/0")
 	waitFor(t, time.Second, func() bool { return fr.startedCount() == 3 }, "third download starts after slot frees")
 }
 
@@ -218,7 +248,7 @@ func TestFIFOOrder(t *testing.T) {
 	if first != "https://v/0" {
 		t.Fatalf("first started = %q, want https://v/0", first)
 	}
-	fr.releaseURL(first)
+	fr.releaseURL(t, first)
 	waitFor(t, time.Second, func() bool { return fr.startedCount() == 2 }, "second started")
 	fr.mu.Lock()
 	second := fr.started[1]
@@ -281,7 +311,7 @@ func TestPauseResumeDownload(t *testing.T) {
 		t.Fatalf("state = %s, want downloading/completed", it.State)
 	}
 
-	fr.releaseURL("https://v/x")
+	fr.releaseURL(t, "https://v/x")
 	waitFor(t, time.Second, func() bool {
 		it, ok := m.Get(id)
 		return ok && it.State == ipc.StateCompleted
@@ -304,7 +334,7 @@ func TestPauseQueuedItem(t *testing.T) {
 	}
 	_ = idA
 
-	fr.releaseURL("https://v/a")
+	fr.releaseURL(t, "https://v/a")
 	time.Sleep(50 * time.Millisecond)
 	if _, queued := m.Stats(); queued != 0 {
 		t.Fatalf("paused item must not start; queued=%d", queued)
@@ -476,7 +506,7 @@ func TestFailedRunCapturesError(t *testing.T) {
 	m, _ := newTestManager(t, 1, fr)
 	id, _ := m.Add("https://x.test/f")
 	waitFor(t, time.Second, func() bool { return fr.startedCount() == 1 }, "started")
-	fr.releaseURL("https://x.test/f")
+	fr.releaseURL(t, "https://x.test/f")
 	waitFor(t, time.Second, func() bool {
 		it, ok := m.Get(id)
 		return ok && it.State == ipc.StateFailed
@@ -496,8 +526,8 @@ func TestClearFinished(t *testing.T) {
 	idGood, _ := m.Add("https://v/good")
 	idBad, _ := m.Add("https://v/bad")
 	waitFor(t, time.Second, func() bool { return fr.startedCount() == 2 }, "both started")
-	fr.releaseURL("https://v/good")
-	fr.releaseURL("https://v/bad")
+	fr.releaseURL(t, "https://v/good")
+	fr.releaseURL(t, "https://v/bad")
 	waitFor(t, time.Second, func() bool {
 		it, _ := m.Get(idGood)
 		it2, _ := m.Get(idBad)
@@ -628,12 +658,13 @@ func TestClearAll(t *testing.T) {
 	idDone, _ := m.Add("https://v/done")
 	idRun, _ := m.Add("https://v/run")
 	idQueue, _ := m.Add("https://v/queue")
-	waitFor(t, time.Second, func() bool { return fr.startedCount() >= 1 }, "first started")
-
-	it, _ := m.Get(idDone)
-	if it.State != ipc.StateDownloading {
-		t.Fatalf("expected first downloading, got %s", it.State)
-	}
+	// Wait for THIS row, not for "any runner started". With a concurrency of
+	// five all three are eligible at once and the scheduler may reach another
+	// one first, which made this assertion fail intermittently under -race.
+	waitFor(t, time.Second, func() bool {
+		it, ok := m.Get(idDone)
+		return ok && it.State == ipc.StateDownloading
+	}, "the first item to be downloading")
 	n, err := m.ClearAll()
 	if err != nil {
 		t.Fatal(err)
@@ -833,7 +864,7 @@ func TestResumeFailedRetriesDownload(t *testing.T) {
 	m, _ := newTestManager(t, 1, fr)
 	id, _ := m.Add("https://v/f")
 	waitFor(t, time.Second, func() bool { return fr.startedCount() == 1 }, "first attempt started")
-	fr.releaseURL("https://v/f")
+	fr.releaseURL(t, "https://v/f")
 	waitFor(t, time.Second, func() bool {
 		it, _ := m.Get(id)
 		return it.State == ipc.StateFailed
@@ -846,7 +877,7 @@ func TestResumeFailedRetriesDownload(t *testing.T) {
 	fr.mu.Lock()
 	delete(fr.errs, "https://v/f")
 	fr.mu.Unlock()
-	fr.releaseURL("https://v/f")
+	fr.releaseURL(t, "https://v/f")
 	waitFor(t, time.Second, func() bool {
 		it, _ := m.Get(id)
 		return it.State == ipc.StateCompleted
@@ -1179,7 +1210,11 @@ func TestAddRejectsDuplicateURL(t *testing.T) {
 	}
 	for _, st := range blocking {
 		t.Run(string(st), func(t *testing.T) {
-			m, _ := newTestManager(t, 1, newFakeRunner())
+			// Concurrency 0: nothing is scheduled, so the state forced below
+			// stays put. With a slot free, the scheduler could move the row to
+			// "downloading" between the assignment and the assertion, which
+			// made this fail intermittently under -race.
+			m, _ := newTestManager(t, 0, newFakeRunner())
 			const u = "https://example.com/dup"
 			id, err := m.Add(u)
 			if err != nil {

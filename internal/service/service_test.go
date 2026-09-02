@@ -7,20 +7,23 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"yt-dlp-manager/internal/filelock"
 	"yt-dlp-manager/internal/ipc"
 	"yt-dlp-manager/internal/manager"
 )
 
 type fakeRunner struct{ dir string }
 
-func (f fakeRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (f fakeRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "t"}}, nil
 }
 
-func (f fakeRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f fakeRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	target := filepath.Join(f.dir, "done.bin")
 	onLine(manager.PrintLine("@g|", target))
 	if err := os.WriteFile(target, []byte("video"), 0o600); err != nil {
@@ -396,5 +399,213 @@ func TestServiceServesIPCClients(t *testing.T) {
 	if ln, err := net.Listen("unix", o.SocketPath); err == nil {
 		ln.Close()
 		t.Error("live socket path must not be rebindable")
+	}
+}
+
+// TestSecondInstanceIsRefusedWithALongStateName proves single-owner protection
+// survives the name shortening that long state filenames force. If two state
+// files could share a lock — or a lock could alias its own state file — a
+// second instance would start against state the first is still writing.
+func TestSecondInstanceIsRefusedWithALongStateName(t *testing.T) {
+	dir := t.TempDir()
+	// At the component limit, so the lock name must be shortened.
+	statePath := filepath.Join(dir, strings.Repeat("s", 255))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, err := Start(ctx, Options{
+		Max: 1, StatePath: statePath,
+		SocketPath: filepath.Join(dir, "a.sock"),
+		InboxPath:  filepath.Join(dir, "a.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err != nil {
+		t.Fatalf("first instance did not start: %v", err)
+	}
+	defer first.Close()
+
+	second, err := Start(ctx, Options{
+		Max: 1, StatePath: statePath,
+		SocketPath: filepath.Join(dir, "b.sock"),
+		InboxPath:  filepath.Join(dir, "b.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err == nil {
+		second.Close()
+		t.Fatal("a second instance started against the same state file")
+	}
+	if !errors.Is(err, ErrOwnerAlive) {
+		t.Errorf("second instance error = %v, want ErrOwnerAlive", err)
+	}
+
+	// A DIFFERENT state file sharing the same long prefix must still start:
+	// the shortening must not merge two states into one lock.
+	other := filepath.Join(dir, strings.Repeat("s", 250)+"other")
+	third, err := Start(ctx, Options{
+		Max: 1, StatePath: other,
+		SocketPath: filepath.Join(dir, "c.sock"),
+		InboxPath:  filepath.Join(dir, "c.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err != nil {
+		t.Fatalf("a distinct state file was refused, so two states share one lock: %v", err)
+	}
+	third.Close()
+}
+
+// TestStateFileNamedLikeALockDoesNotStealOwnership drives the exact collision
+// through two real services: "foo" and "foo.lock" are both legitimate state
+// paths, and under a "<state>.lock" naming scheme the first instance's lock IS
+// the second instance's state file — whose next save atomically replaces that
+// inode, silently ending the first one's ownership.
+func TestStateFileNamedLikeALockDoesNotStealOwnership(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a, err := Start(ctx, Options{
+		Max: 1, StatePath: filepath.Join(dir, "foo"),
+		SocketPath: filepath.Join(dir, "a.sock"),
+		InboxPath:  filepath.Join(dir, "a.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err != nil {
+		t.Fatalf("first instance did not start: %v", err)
+	}
+	defer a.Close()
+	if _, err := os.Lstat(filepath.Join(dir, "foo.lock")); !os.IsNotExist(err) {
+		t.Fatalf("transitional locking manufactured another valid state path: %v", err)
+	}
+
+	// A second, unrelated state file that happens to be named like A's lock.
+	b, err := Start(ctx, Options{
+		Max: 1, StatePath: filepath.Join(dir, "foo.lock"),
+		SocketPath: filepath.Join(dir, "b.sock"),
+		InboxPath:  filepath.Join(dir, "b.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err != nil {
+		t.Fatalf("a distinct state file was refused: %v", err)
+	}
+	// B writes, which under the old scheme replaced the inode A held.
+	if _, err := b.Manager().Add("https://example.test/b"); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+
+	// A must still own its state: a second A is refused.
+	second, err := Start(ctx, Options{
+		Max: 1, StatePath: filepath.Join(dir, "foo"),
+		SocketPath: filepath.Join(dir, "c.sock"),
+		InboxPath:  filepath.Join(dir, "c.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err == nil {
+		second.Close()
+		t.Fatal("a second instance started: the first one's ownership lock was revoked")
+	}
+	if !errors.Is(err, ErrOwnerAlive) {
+		t.Errorf("error = %v, want ErrOwnerAlive", err)
+	}
+}
+
+func TestExistingLegacyLockBlocksUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.json")
+	legacyPath := state + ".lock"
+	oldOwner, err := filelock.Acquire(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldOwner.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked, err := Start(ctx, Options{
+		Max: 1, StatePath: state,
+		SocketPath: filepath.Join(dir, "blocked.sock"),
+		InboxPath:  filepath.Join(dir, "blocked.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err == nil {
+		blocked.Close()
+		t.Fatal("new service started while an old process held the legacy lock")
+	}
+	if !errors.Is(err, ErrOwnerAlive) {
+		t.Fatalf("upgrade error = %v, want ErrOwnerAlive", err)
+	}
+
+	if err := oldOwner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Start(ctx, Options{
+		Max: 1, StatePath: state,
+		SocketPath: filepath.Join(dir, "upgraded.sock"),
+		InboxPath:  filepath.Join(dir, "upgraded.inbox"),
+		Runner:     fakeRunner{dir},
+	})
+	if err != nil {
+		t.Fatalf("service did not start after old owner exited: %v", err)
+	}
+	upgraded.Close()
+}
+
+// TestSymlinkedStatePathIsOneOwner: /real/state.json and /alias/state.json,
+// where alias is a symlink to real, are one file with two spellings. Lexical
+// cleaning does not notice, so hashing the spelling would hand out two locks
+// for one state and let two services write it at once.
+func TestSymlinkedStatePathIsOneOwner(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, err := Start(ctx, Options{
+		Max: 1, StatePath: filepath.Join(real, "state.json"),
+		SocketPath: filepath.Join(root, "a.sock"),
+		InboxPath:  filepath.Join(root, "a.inbox"),
+		Runner:     fakeRunner{root},
+	})
+	if err != nil {
+		t.Fatalf("first instance did not start: %v", err)
+	}
+	defer first.Close()
+
+	second, err := Start(ctx, Options{
+		Max: 1, StatePath: filepath.Join(alias, "state.json"),
+		SocketPath: filepath.Join(root, "b.sock"),
+		InboxPath:  filepath.Join(root, "b.inbox"),
+		Runner:     fakeRunner{root},
+	})
+	if err == nil {
+		second.Close()
+		t.Fatal("a second instance started on the same state through a symlinked path")
+	}
+	if !errors.Is(err, ErrOwnerAlive) {
+		t.Errorf("error = %v, want ErrOwnerAlive", err)
+	}
+}
+
+// TestSymlinkCannotPlaceStateInTheLockDirectory: the lock namespace is off
+// limits to state files, and a symlink must not be a way around that.
+func TestSymlinkCannotPlaceStateInTheLockDirectory(t *testing.T) {
+	root := t.TempDir()
+	locks := filepath.Join(root, ".locks")
+	if err := os.MkdirAll(locks, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "sneaky")
+	if err := os.Symlink(locks, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := manager.NewStore(filepath.Join(alias, "state.json")); err == nil {
+		t.Error("a symlink placed a state file inside the lock directory")
 	}
 }

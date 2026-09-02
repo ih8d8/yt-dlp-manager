@@ -34,6 +34,7 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/downloads/{id}/thumbnail", s.requireAdmin(s.handleThumbnail))
 	mux.HandleFunc("POST /api/v1/downloads/actions", s.requireAdmin(s.handleBatchActions))
 	mux.HandleFunc("POST /api/v1/downloads/clear", s.requireAdmin(s.handleDownloadsClear))
+	mux.HandleFunc("POST /api/v1/formats", s.requireAdmin(s.handleFormats))
 
 	mux.HandleFunc("GET /api/v1/events", s.requireAdmin(s.handleEvents))
 

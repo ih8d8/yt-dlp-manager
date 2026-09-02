@@ -20,11 +20,13 @@ type clearRunner struct {
 	dir string
 }
 
-func (c clearRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (c clearRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "Clear Video"}}, nil
 }
 
-func (c clearRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (c clearRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
+	url := job.URL
 	if strings.Contains(url, "hold") {
 		// Stays in "downloading" until cancelled. A runner that finishes
 		// instantly makes Add-then-Pause a race against the scheduler: the

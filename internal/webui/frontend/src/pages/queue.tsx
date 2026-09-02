@@ -4,8 +4,9 @@ import type { AppState } from '../state/downloads'
 import { queueOrder, rangeBetween, reduce } from '../state/downloads'
 import { api } from '../api/client'
 import type { ClearScope } from '../api/client'
-import type { Download } from '../api/types'
+import type { Download, DownloadOptions } from '../api/types'
 import { Dialog } from '../components/dialog'
+import { AddOptionsDialog } from '../components/add-options-dialog'
 import { DownloadRow, StatePill } from '../components/download-row'
 import { Thumb } from '../components/thumb'
 import { formatBytes, formatEta, formatPercent, formatSpeed, displayTitle, hasKnownTotal, summarizeBulkRetry } from '../format'
@@ -31,6 +32,9 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     clearSelection: boolean
   } | null>(null)
   const [confirmClearAll, setConfirmClearAll] = useState(false)
+  // The URL the options dialog is open for. Held separately from `url` so the
+  // field keeps its value if the dialog is cancelled.
+  const [optionsFor, setOptionsFor] = useState<string | null>(null)
   const [clearBusy, setClearBusy] = useState<ClearScope | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [retryAllBusy, setRetryAllBusy] = useState(false)
@@ -103,6 +107,27 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     } finally {
       setSubmitting(false)
     }
+  }
+
+  // Opening the options dialog validates the URL first, so a typo is reported
+  // at the field rather than as a failed format probe inside the dialog.
+  const openOptions = () => {
+    const err = validateUrl(url)
+    if (err) {
+      setAddError(err)
+      return
+    }
+    setAddError(null)
+    setOptionsFor(url.trim())
+  }
+
+  const addWithOptions = async (options: DownloadOptions | undefined, startNow: boolean) => {
+    const target = optionsFor
+    if (!target) return
+    await api.addDownload(target, options, startNow)
+    setOptionsFor(null)
+    setUrl('')
+    pushToast(startNow ? 'Added and starting now' : 'Added to queue', true)
   }
 
   // Queue-wide actions. The server owns the semantics (manager.ClearFinished
@@ -346,11 +371,30 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
             setUrl((e.target as HTMLInputElement).value)
             setAddError(null)
           }}
+          onKeyDown={(e) => {
+            // Enter adds with the configured defaults; Ctrl/Cmd+Enter opens
+            // the picker, so neither path costs the other a click.
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+              e.preventDefault()
+              openOptions()
+            }
+          }}
           disabled={!connected || submitting}
         />
-        <button class="btn primary" type="submit" disabled={!connected || submitting}>
-          {submitting ? 'Adding…' : 'Add download'}
-        </button>
+        <div class="add-actions">
+          <button class="btn primary" type="submit" disabled={!connected || submitting}>
+            {submitting ? 'Adding…' : 'Add download'}
+          </button>
+          <button
+            class="btn"
+            type="button"
+            disabled={!connected || submitting}
+            title="Choose quality, format and subtitles for this download"
+            onClick={openOptions}
+          >
+            Add with options…
+          </button>
+        </div>
       </form>
       {addError && <p class="field-error add-download-error" role="alert">{addError}</p>}
 
@@ -544,6 +588,14 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
         </Dialog>
       )}
 
+      {optionsFor && (
+        <AddOptionsDialog
+          url={optionsFor}
+          onCancel={() => setOptionsFor(null)}
+          onAdd={addWithOptions}
+        />
+      )}
+
       {details && (
         <DetailsDrawer download={details} onClose={() => setDetailsId(null)} />
       )}
@@ -710,6 +762,12 @@ export function DetailsDrawer({ download: d, onClose }: { download: Download; on
           </dd>
           <dt>Pause origin</dt>
           <dd>{d.pause_origin}</dd>
+          <dt>Options</dt>
+          <dd>
+            {d.options_invalid
+              ? 'unreadable after a restart — remove this row and add the URL again'
+              : d.options_summary || 'defaults from Settings'}
+          </dd>
           <dt>Progress</dt>
           <dd>
             {hasKnownTotal(d.total_bytes) ? (

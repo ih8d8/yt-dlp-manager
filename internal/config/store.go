@@ -104,6 +104,11 @@ func (s *Store) Load() (*Loaded, error) {
 					return nil, s.quarantine(err)
 				}
 				present["downloads.max_concurrent"] = true
+			case "extra_args":
+				if err := json.Unmarshal(v, &f.Downloads.ExtraArgs); err != nil {
+					return nil, s.quarantine(err)
+				}
+				present["downloads.extra_args"] = true
 			default:
 				return nil, s.quarantine(fmt.Errorf("unknown downloads field %q", k))
 			}

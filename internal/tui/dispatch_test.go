@@ -17,11 +17,12 @@ import (
 // merged yt-dlp run.
 type growRunner struct{ dir string }
 
-func (f growRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (f growRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "t"}}, nil
 }
 
-func (f growRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f growRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	target := filepath.Join(f.dir, "done.bin")
 	onLine(manager.PrintLine("@g|", target))
 	if err := os.WriteFile(target, []byte("video"), 0o600); err != nil {

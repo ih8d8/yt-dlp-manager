@@ -7,6 +7,7 @@ import { api } from '../api/client'
 import { Dialog } from '../components/dialog'
 import { DownloadRow } from '../components/download-row'
 import { DetailsDrawer } from './queue'
+import { summarizeBulkClear } from '../format'
 
 interface PageProps {
   state: AppState
@@ -15,6 +16,19 @@ interface PageProps {
 
 type LibFilter = 'all' | 'completed' | 'failed' | 'deleted'
 type SortKey = 'newest' | 'oldest' | 'title' | 'size'
+
+// Mirrors maxBatchIDs in internal/httpapi/downloads.go.
+const MAX_BATCH_IDS = 500
+
+/** What one "Clear …" button clears. 'history' is every finished state. */
+type ClearTarget = 'completed' | 'failed' | 'deleted' | 'history'
+
+const CLEAR_LABELS: Record<ClearTarget, string> = {
+  completed: 'completed',
+  failed: 'failed',
+  deleted: 'files-deleted',
+  history: 'all history'
+}
 
 /**
  * Library is a filtered view over completed/failed/deleted manager items.
@@ -29,6 +43,8 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set())
   const [selection, setSelection] = useState<Set<string>>(new Set())
   const [confirmRemove, setConfirmRemove] = useState<string[] | null>(null)
+  const [confirmClear, setConfirmClear] = useState<ClearTarget | null>(null)
+  const [clearBusy, setClearBusy] = useState<ClearTarget | null>(null)
   const [detailsId, setDetailsId] = useState<string | null>(null)
 
   const connected = state.connected && state.everConnected
@@ -157,8 +173,6 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
       const resp = await api.batchAction(action, [id])
       if (resp.results[0]?.ok === false) {
         pushToast(resp.results[0].error?.message ?? 'action failed')
-      } else if (resp.results[0]?.note) {
-        pushToast(resp.results[0].note)
       }
     } catch (e) {
       pushToast(e instanceof Error ? e.message : 'action failed')
@@ -168,6 +182,63 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
         n.delete(id)
         return n
       })
+    }
+  }
+
+  // Counts come from every tracked item, not the filtered page: a button that
+  // says "Clear failed (12)" must mean the same thing whatever the view is
+  // currently filtered or searched down to.
+  const all = [...state.downloads.values()]
+  const idsFor = (target: ClearTarget): string[] =>
+    all
+      .filter((d) =>
+        target === 'history'
+          ? d.state === 'completed' || d.state === 'failed' || d.state === 'deleted'
+          : d.state === target
+      )
+      .map((d) => d.id)
+
+  const clearCounts: Record<ClearTarget, number> = {
+    completed: idsFor('completed').length,
+    failed: idsFor('failed').length,
+    deleted: idsFor('deleted').length,
+    history: idsFor('history').length
+  }
+
+  const runClear = async (target: ClearTarget) => {
+    setClearBusy(target)
+    try {
+      if (target === 'history') {
+        // One server-side call rather than thousands of ids over the wire:
+        // the clear endpoint's "finished" scope is exactly the three states
+        // this page shows.
+        const resp = await api.clearQueue('finished')
+        pushToast(
+          resp.removed > 0 ? `Cleared ${resp.removed} entries` : 'Nothing to clear',
+          true
+        )
+      } else {
+        const ids = idsFor(target)
+        const results: { id: string; ok: boolean; error?: { message?: string } }[] = []
+        let sendError: string | null = null
+        for (let i = 0; i < ids.length; i += MAX_BATCH_IDS) {
+          try {
+            const resp = await api.batchAction('remove', ids.slice(i, i + MAX_BATCH_IDS))
+            results.push(...resp.results)
+          } catch (e) {
+            sendError = e instanceof Error ? e.message : 'clear failed'
+            break
+          }
+        }
+        const verdict = summarizeBulkClear(ids.length, results, sendError)
+        pushToast(verdict.message, verdict.ok)
+      }
+      setSelection(new Set())
+      setPage(0)
+    } catch (e) {
+      pushToast(e instanceof Error ? e.message : 'clear failed')
+    } finally {
+      setClearBusy(null)
     }
   }
 
@@ -218,6 +289,35 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
         History from the running manager, not a separate archive — clearing
         finished items in the queue removes them here too.
       </p>
+
+      <div class="queue-management" role="group" aria-labelledby="library-actions-title">
+        <div class="queue-management-copy">
+          <strong id="library-actions-title">Library actions</strong>
+          <span>
+            Clearing drops history entries only. Downloaded files are never
+            deleted.
+          </span>
+        </div>
+        <div class="global-actions library-actions" role="toolbar" aria-label="Library-wide actions">
+          {(['completed', 'failed', 'deleted', 'history'] as ClearTarget[]).map((target) => (
+            <button
+              key={target}
+              class="btn small"
+              disabled={!connected || clearBusy !== null || clearCounts[target] === 0}
+              onClick={() => setConfirmClear(target)}
+              title={
+                target === 'history'
+                  ? 'Remove every completed, failed and files-deleted entry from the list'
+                  : `Remove every ${CLEAR_LABELS[target]} entry from the list`
+              }
+            >
+              {clearBusy === target
+                ? 'Clearing…'
+                : `Clear ${CLEAR_LABELS[target]}${clearCounts[target] > 0 ? ` (${clearCounts[target]})` : ''}`}
+            </button>
+          ))}
+        </div>
+      </div>
 
       {selection.size > 0 && (
         <div class="selection-bar" role="toolbar" aria-label="Library selection actions">
@@ -312,6 +412,42 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
               }}
             >
               Remove from history
+            </button>
+          </div>
+        </Dialog>
+      )}
+
+      {confirmClear && (
+        <Dialog
+          title={`Clear ${CLEAR_LABELS[confirmClear]}?`}
+          onClose={() => clearBusy === null && setConfirmClear(null)}
+        >
+          <p>
+            This removes {clearCounts[confirmClear]}{' '}
+            {confirmClear === 'history'
+              ? 'history entries'
+              : `${CLEAR_LABELS[confirmClear]} entries`}{' '}
+            from the manager's list. Downloaded files stay on disk — only the
+            list entries go.
+          </p>
+          <div class="dialog-actions">
+            <button
+              class="btn"
+              disabled={clearBusy !== null}
+              onClick={() => setConfirmClear(null)}
+            >
+              Cancel
+            </button>
+            <button
+              class="btn danger"
+              disabled={clearBusy !== null}
+              onClick={() => {
+                const target = confirmClear
+                setConfirmClear(null)
+                void runClear(target)
+              }}
+            >
+              Clear {CLEAR_LABELS[confirmClear]}
             </button>
           </div>
         </Dialog>

@@ -3,6 +3,8 @@ import { Component } from 'preact'
 interface DialogProps {
   title: string
   onClose: () => void
+  /** Roomier box for dialogs that hold a form rather than a confirmation. */
+  wide?: boolean
   children: preact.ComponentChildren
 }
 /**
@@ -62,11 +64,11 @@ export class Dialog extends Component<DialogProps> {
     }
   }
 
-  render({ title, children, onClose }: DialogProps) {
+  render({ title, children, onClose, wide }: DialogProps) {
     return (
       <div class="overlay" onKeyDown={this.onKey}>
         <div
-          class="dialog"
+          class={wide ? 'dialog dialog-wide' : 'dialog'}
           role="dialog"
           aria-modal="true"
           aria-label={title}

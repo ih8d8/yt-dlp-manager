@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -215,6 +216,19 @@ func runServer(args []string) int {
 
 	loopback := isLoopbackListen(cfg.Server.Listen)
 
+	// Parsed before anything binds or starts: a typo here would otherwise
+	// silently trust nothing, leaving the login limiter collapsed onto one
+	// shared bucket exactly where the operator meant to fix it.
+	trustedProxies, err := trustedProxiesFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"%s server: YTDLP_MANAGER_TRUSTED_PROXIES: %v\n\n"+
+				"Expected a comma-separated list of IP addresses or CIDR blocks,\n"+
+				"for example \"127.0.0.1\" or \"10.0.0.0/8,::1\".\n",
+			productName, err)
+		return 1
+	}
+
 	// Preflight: the state directory must be writable before anything tries
 	// to create the session key or open state. Container bind mounts are the
 	// common failure (Docker creates missing host dirs as root while we run
@@ -311,6 +325,7 @@ func runServer(args []string) int {
 	// concurrently with those still-running handlers.
 	svc, err := service.Start(context.Background(), service.Options{
 		Max:        cfg.Downloads.MaxConcurrent,
+		ExtraArgs:  cfg.Downloads.ExtraArgs,
 		StatePath:  sf.state,
 		SocketPath: sf.socket,
 	})
@@ -332,6 +347,7 @@ func runServer(args []string) int {
 		SecureCookie:         cfg.Server.SecureCookie,
 		Listen:               cfg.Server.Listen,
 		TrustedHosts:         trustedHostsFromEnv(),
+		TrustedProxies:       trustedProxies,
 		SetupToken:           setupToken,
 		StatePath:            stateDirFor(sf.state),
 		StateDir:             filepath.Dir(stateDirFor(sf.state)),
@@ -589,6 +605,19 @@ func goVersion() string { return runtime.Version() }
 // trusted Host does not establish client locality or authorize first-run
 // setup; non-loopback peers still need the one-time setup token. The list is
 // useful when a reverse proxy uses a name the app cannot infer from its bind.
+// trustedProxiesFromEnv reads YTDLP_MANAGER_TRUSTED_PROXIES, a comma-separated
+// list of IP addresses and CIDR blocks naming the reverse proxies in front of
+// this server. It exists because login rate limiting keys on the socket peer:
+// behind a proxy that is the proxy's address for everyone, so one attacker's
+// failures drive the shared backoff to its ceiling and lock the administrator
+// out. Naming the proxy lets the limiter read the forwarded chain instead.
+//
+// It does not relax first-run setup authorization, which keeps reading the
+// accepted socket — see peerIsLoopback.
+func trustedProxiesFromEnv() ([]netip.Prefix, error) {
+	return httpapi.ParseTrustedProxies(os.Getenv("YTDLP_MANAGER_TRUSTED_PROXIES"))
+}
+
 func trustedHostsFromEnv() []string {
 	raw := strings.TrimSpace(os.Getenv("YTDLP_MANAGER_TRUSTED_HOSTS"))
 	if raw == "" {

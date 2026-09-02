@@ -259,8 +259,10 @@
 .thumb-large {
   /* Keep the details card compact enough for a 720–768px-tall laptop screen.
      A full-width 16:9 preview consumed most of the dialog height and created
-     a scrollbar as soon as the Started field appeared. */
-  width: min(600px, 100%);
+     a scrollbar as soon as the Started field appeared. Leave a little extra
+     headroom for that live-only row instead of fitting only the shorter
+     recovered/paused state used when the dialog first opens. */
+  width: min(580px, 100%);
   margin-left: auto;
   margin-right: auto;
   margin-top: 8px;
@@ -618,6 +620,10 @@
   .main { padding: 20px 16px 112px; }
   .add-download-bar,
   .library-filters { gap: 8px; }
+  /* Side by side on a phone too — stacking them made the picker look like an
+     afterthought below the fold. */
+  .add-actions { width: 100%; flex-wrap: nowrap; }
+  .add-actions .btn { flex: 1; min-width: 0; padding: 0 10px; }
   .add-download-bar .input,
   .library-filters .input:first-of-type { min-width: 100%; }
   .summary-line { margin: 14px 0; row-gap: 4px; }
@@ -626,6 +632,9 @@
   .queue-management { align-items: stretch; flex-direction: column; gap: 12px; }
   .global-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .global-actions .btn { width: 100%; }
+  /* Four clear actions read as a 2x2 block rather than a row of three with an
+     orphan underneath. */
+  .global-actions.library-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .queue-table { overflow: visible; border: 0; border-radius: 0; background: transparent; }
   .queue-table .queue-head { display: none; }
   .queue-table .queue-list { display: flex; flex-direction: column; gap: 10px; }
@@ -851,6 +860,106 @@
   justify-content: flex-end;
   gap: 10px;
   margin-top: 18px;
+}
+
+/* Two named buttons rather than one split control: a bare chevron next to
+   "Add download" does not say what it opens, and the picker is worth naming.
+   The primary style stays on the fast path so the default action still reads
+   as the default. */
+.add-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ---- add-with-options dialog ---- */
+.dialog-wide {
+  max-width: 620px;
+}
+.dialog-sub {
+  margin: 0 0 14px;
+  overflow-wrap: anywhere;
+}
+.opt-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  margin: 0 0 14px;
+}
+.opt-group legend {
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.opt-modes {
+  display: flex;
+  gap: 18px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.opt-modes label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.opt-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.opt-rows {
+  display: grid;
+  gap: 10px;
+}
+.opt-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.opt-row > span {
+  color: var(--muted);
+}
+.opt-row .input {
+  width: 100%;
+  min-width: 0;
+}
+.opt-check {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+}
+.opt-hint {
+  margin: 0 0 8px;
+}
+.opt-preview {
+  margin: 0 0 4px;
+  display: grid;
+  gap: 4px;
+}
+/* The argument list can be long and must never widen the dialog. */
+.opt-preview code {
+  display: block;
+  overflow-x: auto;
+  white-space: pre;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--raised);
+  color: var(--text);
+}
+@media (max-width: 640px) {
+  .opt-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .opt-check {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
 }
 .card .dialog-actions {
   margin-top: 20px;
@@ -1180,6 +1289,30 @@
 .kv {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
+}
+
+/* A titled block inside a card, separated from the fields above it without
+   becoming a card of its own. */
+.subsection {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.subsection h4 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+/* Command-line text: monospace, wrapping, and tall enough to read a long
+   argument list without scrolling it one line at a time. */
+.input-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  resize: vertical;
 }
 
 /* ---- login ---- */

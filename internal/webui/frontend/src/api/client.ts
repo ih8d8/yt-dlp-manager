@@ -102,8 +102,21 @@ export const api = {
   },
   getDownload: (id: string) =>
     request<{ download: import('./types').Download }>('GET', `/api/v1/downloads/${encodeURIComponent(id)}`),
-  addDownload: (url: string) =>
-    request<import('./types').AddDownloadResponse>('POST', '/api/v1/downloads', { url, start_now: false }),
+  addDownload: (
+    url: string,
+    options?: import('./types').DownloadOptions,
+    startNow = false
+  ) =>
+    request<import('./types').AddDownloadResponse>('POST', '/api/v1/downloads', {
+      url,
+      start_now: startNow,
+      // Omitted entirely rather than sent empty: an absent options object is
+      // what tells the server to use the configured defaults.
+      ...(options && Object.keys(options).length > 0 ? { options } : {})
+    }),
+
+  formats: (url: string) =>
+    request<import('./types').FormatsResponse>('POST', '/api/v1/formats', { url }),
 
   batchAction: (action: string, ids: string[]) =>
     request<{ results: import('./types').BatchResult[] }>('POST', '/api/v1/downloads/actions', {
@@ -119,7 +132,7 @@ export const api = {
   settings: () => request<import('./types').SettingsView>('GET', '/api/v1/settings'),
   saveSettings: (patch: {
     ui?: { theme?: string; compact?: boolean }
-    downloads?: { max_concurrent?: number }
+    downloads?: { max_concurrent?: number; extra_args?: string }
   }) => request<import('./types').SettingsView>('PUT', '/api/v1/settings', patch),
 
   ytDlpSettings: () => request<import('./types').YtDlpSettingsResponse>('GET', '/api/v1/settings/yt-dlp'),
