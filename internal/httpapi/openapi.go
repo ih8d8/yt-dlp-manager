@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"net/http"
+
+	"yt-dlp-manager/internal/ipc"
 )
 
 // handleOpenAPI serves GET /api/v1/openapi.json: a hand-maintained OpenAPI
@@ -122,15 +124,16 @@ func openapiDocument() map[string]any {
 
 	addDownloads := oaMutation(oaOperation(
 		"Add download",
-		"Queue one video or playlist URL. The URL must be http(s), at most 4096 bytes, without control characters or a leading dash. A URL an existing queued, downloading, paused or completed entry already holds is rejected with 409 duplicate_url rather than queued twice; failed and deleted entries do not block a re-add. With start_now the item jumps the queue and may run beyond max_concurrent, up to a hard ceiling of max_concurrent + 8 concurrent downloads; past that it stays queued until a slot frees. If forcing fails the item stays queued and the response reports the partial result.",
+		"Queue one video or playlist URL. The URL must be http(s), at most 4096 bytes, without control characters or a leading dash. A URL an existing queued, downloading, paused or completed entry already holds is rejected with 409 duplicate_url rather than queued twice, whatever options accompany it: yt-dlp's output template decides the filename and rarely varies by format, so two entries for one URL would resolve to one file and the second would overwrite or skip the first. To fetch another quality, give the output template a format-distinguishing field (%(format_id)s, %(height)s) so the two cannot collide, or remove the existing entry AND move its file \u2014 removal keeps the media on disk, and yt-dlp would otherwise find it and skip the new download. Failed and deleted entries do not block a re-add. Options are per-download overrides passed to yt-dlp on the command line, so they beat both the configuration file and the global downloads.extra_args for this item only, and anything left unset still comes from them; they are stored with the item, so a retry or a restart downloads what was originally asked for. Every option except extra_args is a closed set of structured choices; extra_args is yt-dlp command line text constrained by an allowlist (see the DownloadOptions schema). With start_now the item jumps the queue and may run beyond max_concurrent, up to a hard ceiling of max_concurrent + 8 concurrent downloads; past that it stays queued until a slot frees. If forcing fails the item stays queued and the response reports the partial result.",
 		"Downloads", protected), "Per-session CSRF token returned by GET /api/v1/session.")
 	addDownloads["requestBody"] = oaBody("#/components/schemas/AddDownloadRequest", map[string]any{
 		"url": "https://www.youtube.com/watch?v=...", "start_now": false,
+		"options": map[string]any{"preset": "1080p", "merge_container": "mp4"},
 	})
 	addDownloads["responses"] = map[string]any{
 		"201": oaJSONResponse("queued", "#/components/schemas/AddDownloadResponse"),
 		"409": oaJSONResponse("a live entry already holds this URL", "#/components/schemas/Error"),
-		"422": oaJSONResponse("invalid URL", "#/components/schemas/Error"),
+		"422": oaJSONResponse("invalid URL, unusable options, or an entry too large to store", "#/components/schemas/Error"),
 	}
 
 	getDownload := oaOperation("Get download", "One item with full details including recorded file paths and bounded failure text.", "Downloads", protected)
@@ -165,6 +168,20 @@ func openapiDocument() map[string]any {
 	actions["responses"] = map[string]any{
 		"200": oaJSONResponse("per-id results (overall 200 even when some ids fail)", "#/components/schemas/ActionsResponse"),
 		"422": oaJSONResponse("unknown action or empty/oversized id list", "#/components/schemas/Error"),
+	}
+
+	formats := oaMutation(oaOperation(
+		"List formats",
+		"Report the video and audio streams one URL offers, so a caller can pick a specific format instead of relying on the configured default. Playlists are not walked: the first entry's formats are returned. Bounded by a concurrency ceiling, a 20s end-to-end timeout (including the wait for a free slot, kept under the server's write timeout so the timeout can actually be reported) and a short server-side cache; storyboard pseudo-formats are omitted, and any format id that would be rejected by POST /api/v1/downloads is never offered. It is a POST because it spawns a yt-dlp process, which keeps it behind the same CSRF check as every other mutation.",
+		"Downloads", protected), "Per-session CSRF token returned by GET /api/v1/session.")
+	formats["requestBody"] = oaBody("#/components/schemas/FormatsRequest", map[string]any{
+		"url": "https://www.youtube.com/watch?v=...",
+	})
+	formats["responses"] = map[string]any{
+		"200": oaJSONResponse("available formats", "#/components/schemas/FormatsResponse"),
+		"422": oaJSONResponse("invalid URL", "#/components/schemas/Error"),
+		"501": oaJSONResponse("this server cannot list formats", "#/components/schemas/Error"),
+		"502": oaJSONResponse("the extractor could not read this URL", "#/components/schemas/Error"),
 	}
 
 	clear := oaMutation(oaOperation(
@@ -238,7 +255,7 @@ func openapiDocument() map[string]any {
 		"Patch UI and download settings. Unknown fields are rejected. Concurrency must be 1..100; the runtime cap is applied before persistence and rolled back if persistence fails.",
 		"Settings", protected), "Per-session CSRF token returned by GET /api/v1/session.")
 	settingsPut["requestBody"] = oaBody("#/components/schemas/SettingsUpdate", map[string]any{
-		"downloads": map[string]any{"max_concurrent": 3},
+		"downloads": map[string]any{"max_concurrent": 3, "extra_args": "--limit-rate 2M"},
 	})
 	settingsPut["responses"] = map[string]any{
 		"200": oaJSONResponse("updated settings view", "#/components/schemas/SettingsView"),
@@ -318,6 +335,7 @@ func openapiDocument() map[string]any {
 			"/api/v1/downloads/{id}/thumbnail": map[string]any{"get": thumbnail},
 			"/api/v1/downloads/actions":        map[string]any{"post": actions},
 			"/api/v1/downloads/clear":          map[string]any{"post": clear},
+			"/api/v1/formats":                  map[string]any{"post": formats},
 			"/api/v1/events":                   map[string]any{"get": events},
 			"/api/v1/settings": map[string]any{
 				"get": settingsGet,
@@ -374,6 +392,9 @@ func openapiDocument() map[string]any {
 						"started_at":             map[string]any{"type": "string", "format": "date-time", "nullable": true},
 						"completed_at":           map[string]any{"type": "string", "format": "date-time", "nullable": true},
 						"allowed_actions":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"options":                map[string]any{"$ref": "#/components/schemas/DownloadOptions"},
+						"options_summary":        map[string]any{"type": "string", "description": "the overrides rendered for display; absent when the item uses the configured defaults"},
+						"options_invalid":        map[string]any{"type": "boolean", "description": "the row's saved options could not be read back after a restart; it cannot be retried, only removed and re-added, because retrying would download something different from what was requested"},
 					},
 					"required": []string{"id", "url", "state", "progress", "added_at", "allowed_actions"},
 				},
@@ -397,7 +418,67 @@ func openapiDocument() map[string]any {
 					"properties": map[string]any{
 						"url":       map[string]any{"type": "string", "maxLength": 4096},
 						"start_now": map[string]any{"type": "boolean", "default": false},
+						"options":   map[string]any{"$ref": "#/components/schemas/DownloadOptions"},
 					},
+				},
+				"DownloadOptions": map[string]any{
+					"type":        "object",
+					"description": "Per-download overrides. Every field is optional; an omitted field means the yt-dlp configuration file decides. preset and explicit format ids are mutually exclusive, audio_format requires audio_only, and sub_langs requires subtitles \"on\".",
+					"properties": map[string]any{
+						"format_id":       map[string]any{"type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_.\\-]{1,64}$", "description": "video format id from POST /api/v1/formats"},
+						"audio_format_id": map[string]any{"type": "string", "maxLength": 64, "pattern": "^[A-Za-z0-9_.\\-]{1,64}$", "description": "audio format id, merged with format_id when both are given"},
+						"preset":          map[string]any{"type": "string", "enum": []string{"best", "2160p", "1440p", "1080p", "720p", "480p", "360p", "audio"}, "description": "resolution ceiling, usable without probing formats first"},
+						"merge_container": map[string]any{"type": "string", "enum": []string{"mp4", "mkv", "webm"}},
+						"audio_only":      map[string]any{"type": "boolean", "description": "extract audio (--extract-audio)"},
+						"audio_format":    map[string]any{"type": "string", "enum": []string{"aac", "alac", "flac", "m4a", "mp3", "opus", "vorbis", "wav"}},
+						"subtitles":       map[string]any{"type": "string", "enum": []string{"on", "off"}, "description": "tri-state: absent means whatever the config file says"},
+						"sub_langs":       map[string]any{"type": "array", "maxItems": ipc.MaxSubLangs, "items": map[string]any{"type": "string", "maxLength": 32}},
+						"extra_args": map[string]any{
+							"type": "string", "maxLength": ipc.MaxExtraArgsLen,
+							"description": "free-form yt-dlp command line text for this download, placed last on the command line so it overrides everything: the options above, the global downloads.extra_args, and the yt-dlp config. Parsed with shell quoting rules but never run through a shell, so no expansion of any kind occurs. Accepted options are a fixed allowlist of ordinary download options (rate limiting, retries, proxy, headers, format sorting, subtitles, SponsorBlock, geo options and similar), which must be spelled in full: yt-dlp accepts unambiguous abbreviations, so a list of forbidden spellings would be bypassable. Selection, filtering and playlist options are excluded deliberately — the manager expands playlists into one entry per video, so they shape nothing, and options that skip a download exit 0 without producing a file. Anything else — an unlisted option, an abbreviation, a short flag, a bare word that yt-dlp would treat as an extra URL, or an option carrying a credential — is refused with 422 invalid_options naming it.",
+						},
+					},
+				},
+				"Format": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"format_id":            map[string]any{"type": "string"},
+						"ext":                  map[string]any{"type": "string"},
+						"resolution":           map[string]any{"type": "string"},
+						"width":                map[string]any{"type": "integer"},
+						"height":               map[string]any{"type": "integer"},
+						"fps":                  map[string]any{"type": "number"},
+						"vcodec":               map[string]any{"type": "string"},
+						"acodec":               map[string]any{"type": "string"},
+						"filesize":             map[string]any{"type": "integer", "format": "int64", "description": "bytes; see filesize_approximate"},
+						"filesize_approximate": map[string]any{"type": "boolean", "description": "the size is yt-dlp's estimate, not a known length"},
+						"tbr":                  map[string]any{"type": "number", "description": "total bitrate, Kbit/s"},
+						"format_note":          map[string]any{"type": "string"},
+						"protocol":             map[string]any{"type": "string"},
+						"language":             map[string]any{"type": "string"},
+						"has_video":            map[string]any{"type": "boolean"},
+						"has_audio":            map[string]any{"type": "boolean"},
+					},
+					"required": []string{"format_id", "has_video", "has_audio"},
+				},
+				"FormatsRequest": map[string]any{
+					"type":     "object",
+					"required": []string{"url"},
+					"properties": map[string]any{
+						"url": map[string]any{"type": "string", "maxLength": 4096},
+					},
+				},
+				"FormatsResponse": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"url":              map[string]any{"type": "string", "format": "uri"},
+						"title":            map[string]any{"type": "string"},
+						"duration_seconds": map[string]any{"type": "number"},
+						"extractor":        map[string]any{"type": "string"},
+						"formats":          map[string]any{"type": "array", "items": map[string]any{"$ref": "#/components/schemas/Format"}},
+						"truncated":        map[string]any{"type": "boolean", "description": "more formats existed than the server reports"},
+					},
+					"required": []string{"formats"},
 				},
 				"AddDownloadResponse": map[string]any{
 					"type": "object",
@@ -432,10 +513,6 @@ func openapiDocument() map[string]any {
 									"id":    map[string]any{"type": "string"},
 									"ok":    map[string]any{"type": "boolean"},
 									"error": map[string]any{"$ref": "#/components/schemas/Error"},
-									"note": map[string]any{
-										"type":        "string",
-										"description": "present when an action succeeded but did not do everything its name implies",
-									},
 								},
 								"required": []string{"id", "ok"},
 							},
@@ -482,7 +559,7 @@ func openapiDocument() map[string]any {
 				},
 				"SettingsView": map[string]any{
 					"type":        "object",
-					"description": "Effective settings; see GET for authoritative shape. ui.theme/compact, downloads.max_concurrent plus its source, security flags, advanced paths.",
+					"description": "Effective settings; see GET for authoritative shape. ui.theme/compact, downloads.max_concurrent plus its source and downloads.extra_args, security flags, advanced paths.",
 					"properties": map[string]any{
 						"ui":        map[string]any{"type": "object"},
 						"downloads": map[string]any{"type": "object"},
@@ -505,6 +582,10 @@ func openapiDocument() map[string]any {
 							"type": "object",
 							"properties": map[string]any{
 								"max_concurrent": map[string]any{"type": "integer", "minimum": 1, "maximum": 100},
+								"extra_args": map[string]any{
+									"type": "string", "maxLength": ipc.MaxExtraArgsLen,
+									"description": "free-form yt-dlp command line text applied to every download. It is placed after the yt-dlp config but BEFORE a download's own picker options and extra_args, so it acts as a default that a single download can override rather than one that overrides them. Same parsing and same allowlist as a download's own extra_args; an unusable value is rejected with 422 invalid_options naming the option, and the live manager keeps its previous value.",
+								},
 							},
 						},
 					},

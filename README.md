@@ -106,9 +106,50 @@ groups to stop yt-dlp and its children together.
 
 ## Configuration
 
-yt-dlp's own config stays authoritative for formats, output paths, cookies,
-retries and post-processing; the manager invokes yt-dlp without a shell and adds
-only progress-oriented arguments.
+yt-dlp's own config stays authoritative; the manager invokes yt-dlp without a
+shell and adds only progress-oriented arguments.
+
+Precedence, lowest to highest: yt-dlp config → global extra arguments → picker
+options → per-download extra arguments.
+
+**Add with options** reads a URL's real formats and overrides quality,
+container, audio extraction and subtitles for one download, stored with the
+entry so retries reuse them. One live entry per URL: to fetch another quality,
+put a format field in your output template (`%(format_id)s`) or remove the
+existing entry and move its file.
+
+**Extra arguments** (in Settings for every download, in the picker for one;
+both empty by default) accept an allowlist of ordinary download options — rate
+limits, retries, proxies, headers, format sorting, subtitles, SponsorBlock.
+Quoting is honoured, no shell runs, and anything else is refused by name; put it
+in your yt-dlp config file instead. This text is stored and returned by the API,
+so keep secrets out of it.
+
+### Behind a reverse proxy
+
+Nothing here is required — this is a one-line tidy-up, not a setup step.
+
+Login rate limiting identifies clients by the address of the connection it
+accepts. A reverse proxy is that address for everyone behind it, so all clients
+share one backoff bucket and someone else's wrong guesses can make your own
+sign-in wait. The wait is capped at a minute, so leaving this alone is fine.
+
+If you would rather each client were limited on its own, name the proxy:
+
+```bash
+YTDLP_MANAGER_TRUSTED_PROXIES=127.0.0.1
+```
+
+Comma-separated IP addresses and CIDR blocks (`10.0.0.0/8,::1`). When the
+connection comes from one of them, the client is read from `X-Forwarded-For`
+instead — walking the chain right to left and stopping at the first address that
+is not itself a trusted proxy, so hops a client prepended are never believed.
+A wrong value fails startup rather than silently trusting nothing.
+
+Set this only for proxies you actually run, and make sure yours overwrites
+`X-Forwarded-For` rather than appending to whatever the client sent. It has no
+effect on first-run setup, which keeps reading the real connection and still
+wants the setup token from off-box.
 
 Manager settings live in `$XDG_CONFIG_HOME/yt-dlp-manager/config.json`,
 overridden by `YTDLP_MANAGER_*` environment variables, then CLI flags. State is

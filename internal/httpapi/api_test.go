@@ -240,11 +240,12 @@ func TestBatchCapsAndValidation(t *testing.T) {
 // the item reaches "completed", Pause becomes a no-op and Resume rejects it.
 type blockingRunner struct{ started chan struct{} }
 
-func (b blockingRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (b blockingRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "Test Video"}}, nil
 }
 
-func (b blockingRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (b blockingRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	select {
 	case b.started <- struct{}{}:
 	default:

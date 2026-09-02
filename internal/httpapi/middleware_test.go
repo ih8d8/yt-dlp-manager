@@ -207,6 +207,31 @@ func TestLoadOrCreateKeyPersistsAndReuses(t *testing.T) {
 	}
 }
 
+func TestLoadOrCreateKeyRotatesOversizedFileWithBoundedRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.key")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxSessionKeyFileBytes + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	key, err := LoadOrCreateKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != sessionKeyBytes {
+		t.Fatalf("key length = %d, want %d", len(key), sessionKeyBytes)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() > maxSessionKeyFileBytes {
+		t.Fatalf("oversized key file was not replaced: info=%v err=%v", info, err)
+	}
+}
+
 func TestLoginLimiterExponentialCap(t *testing.T) {
 	l := newLoginLimiter()
 	if d := delayFor(0); d != 0 {

@@ -18,11 +18,12 @@ import (
 // captured from the @g line, mimicking yt-dlp's merged-output report.
 type dlFake struct{ dir string }
 
-func (f dlFake) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (f dlFake) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "t"}}, nil
 }
 
-func (f dlFake) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f dlFake) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	target := filepath.Join(f.dir, "done.bin")
 	onLine(manager.PrintLine("@g|", target))
 	if err := os.WriteFile(target, []byte("video"), 0o600); err != nil {

@@ -10,24 +10,31 @@ import (
 // Download is the web-facing DTO. It is deliberately separate from ipc.Item
 // so the two wire protocols can evolve independently.
 type Download struct {
-	ID                  string     `json:"id"`
-	URL                 string     `json:"url"`
-	Title               string     `json:"title"`
-	ThumbnailURL        string     `json:"thumbnail_url,omitempty"`
-	State               string     `json:"state"`
-	Forced              bool       `json:"forced"`
-	PauseOrigin         string     `json:"pause_origin"` // none | user | shutdown
-	Progress            float64    `json:"progress"`
-	DownloadedBytes     int64      `json:"downloaded_bytes"`
-	TotalBytes          int64      `json:"total_bytes"`
-	SpeedBytesPerSecond int64      `json:"speed_bytes_per_second"`
-	ETASeconds          int64      `json:"eta_seconds"`
-	Error               string     `json:"error"`
-	Files               []string   `json:"files"`
-	AddedAt             time.Time  `json:"added_at"`
-	StartedAt           *time.Time `json:"started_at"`
-	CompletedAt         *time.Time `json:"completed_at"`
-	AllowedActions      []string   `json:"allowed_actions"`
+	ID                  string   `json:"id"`
+	URL                 string   `json:"url"`
+	Title               string   `json:"title"`
+	ThumbnailURL        string   `json:"thumbnail_url,omitempty"`
+	State               string   `json:"state"`
+	Forced              bool     `json:"forced"`
+	PauseOrigin         string   `json:"pause_origin"` // none | user | shutdown
+	Progress            float64  `json:"progress"`
+	DownloadedBytes     int64    `json:"downloaded_bytes"`
+	TotalBytes          int64    `json:"total_bytes"`
+	SpeedBytesPerSecond int64    `json:"speed_bytes_per_second"`
+	ETASeconds          int64    `json:"eta_seconds"`
+	Error               string   `json:"error"`
+	Files               []string `json:"files"`
+	// Options is present only when this download overrode the configured
+	// defaults; OptionsSummary is the same thing rendered for display.
+	Options        *ipc.Options `json:"options,omitempty"`
+	OptionsSummary string       `json:"options_summary,omitempty"`
+	// OptionsInvalid marks a row whose saved options could not be read back.
+	// It cannot be retried; only removed and re-added.
+	OptionsInvalid bool       `json:"options_invalid,omitempty"`
+	AddedAt        time.Time  `json:"added_at"`
+	StartedAt      *time.Time `json:"started_at"`
+	CompletedAt    *time.Time `json:"completed_at"`
+	AllowedActions []string   `json:"allowed_actions"`
 }
 
 // allowedActionsFor is a pure helper: which actions make sense from a state.
@@ -80,6 +87,17 @@ func toDownload(it ipc.Item) Download {
 		StartedAt:           it.StartedAt,
 		CompletedAt:         it.DoneAt,
 		AllowedActions:      allowedActionsFor(it.State),
+	}
+	if it.OptionsInvalid {
+		// Retrying would run a different download than the one this row
+		// records, so the only honest action left is removing it.
+		d.AllowedActions = []string{"remove"}
+		d.OptionsInvalid = true
+	}
+	if !it.Options.Empty() {
+		opts := it.Options
+		d.Options = &opts
+		d.OptionsSummary = opts.Describe()
 	}
 	if d.Files == nil {
 		d.Files = []string{}

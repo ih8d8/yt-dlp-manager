@@ -17,11 +17,13 @@ import (
 
 type instantRunner struct{ dir string }
 
-func (f instantRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (f instantRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "Test Video"}}, nil
 }
 
-func (f instantRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (f instantRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
+	url := job.URL
 	if strings.Contains(url, "hold") {
 		// Opt-in: a URL containing "hold" stays in "downloading" until it is
 		// cancelled. Everything else finishes before the caller's next
@@ -44,6 +46,20 @@ func newTestManager(t *testing.T) *manager.Manager {
 	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	mgr, err := manager.NewWithRunner(ctx, 4, filepath.Join(dir, "state.json"), instantRunner{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cancel(); mgr.Close() })
+	return mgr
+}
+
+// newTestManagerWithRunner is newTestManager with a caller-supplied runner,
+// for tests that need a capability instantRunner does not have.
+func newTestManagerWithRunner(t *testing.T, r manager.Runner) *manager.Manager {
+	t.Helper()
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr, err := manager.NewWithRunner(ctx, 4, filepath.Join(dir, "state.json"), r)
 	if err != nil {
 		t.Fatal(err)
 	}

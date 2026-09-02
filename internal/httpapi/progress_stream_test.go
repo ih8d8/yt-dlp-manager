@@ -38,11 +38,12 @@ func newHTTPTestServer(t *testing.T, d *Deps) (*Server, string) {
 // what real yt-dlp prints during a multi-second download.
 type stagedRunner struct{ dir string }
 
-func (s stagedRunner) Probe(ctx context.Context, url string) ([]manager.Entry, error) {
+func (s stagedRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
+	url := job.URL
 	return []manager.Entry{{URL: url, Title: "Staged Video"}}, nil
 }
 
-func (s stagedRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (s stagedRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	onLine(manager.PrintLine("@t|", "Staged Video"))
 	for _, line := range []string{
 		"@p|100|1000|50|18",

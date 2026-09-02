@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,11 +17,12 @@ type blockingRunner struct {
 	released int
 }
 
-func (b *blockingRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (b *blockingRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	return []Entry{{URL: url, Title: "t"}}, nil
 }
 
-func (b *blockingRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (b *blockingRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
 	select {
 	case <-b.release:
 	case <-ctx.Done():
@@ -29,6 +31,10 @@ func (b *blockingRunner) Run(ctx context.Context, url string, onLine func(string
 	b.mu.Lock()
 	b.released++
 	b.mu.Unlock()
+	// Name an output, as a real successful run always does: a run that exits
+	// cleanly having produced nothing is treated as a skipped download, not a
+	// completed one.
+	onLine(PrintLine("@g|", "/downloads/"+job.URL[strings.LastIndex(job.URL, "/")+1:]+".mp4"))
 	return "", nil
 }
 

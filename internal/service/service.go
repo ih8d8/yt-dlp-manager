@@ -23,7 +23,13 @@ import (
 var ErrOwnerAlive = errors.New("another yt-dlp-manager instance is already running")
 
 type Options struct {
-	Max        int    // maximum concurrent downloads (<=0 means manager default)
+	Max int // maximum concurrent downloads (<=0 means manager default)
+	// ExtraArgs are the global yt-dlp arguments from configuration. They are
+	// installed on the manager BEFORE the offline inbox is drained: inbox URLs
+	// are scheduled the moment they are added, so setting them afterwards
+	// would let the first downloads after a restart run without the proxy,
+	// headers or rate limit everything else gets.
+	ExtraArgs  string
 	StatePath  string // "" uses the XDG default and enables legacy migration
 	SocketPath string // "" uses the XDG default
 	InboxPath  string // "" uses the XDG default
@@ -38,6 +44,9 @@ type Service struct {
 	// stateLock prevents a second process with a different control socket from
 	// loading and writing the same state file concurrently.
 	stateLock *filelock.Lock
+	// legacyLock is the pre-lock-directory lock name, held only so an older
+	// process still using it blocks this one. Best effort; may be nil.
+	legacyLock *filelock.Lock
 
 	// Interrupted counts unfinished downloads recovered from the previous
 	// process. They are restored paused and stay that way; this is only how
@@ -72,7 +81,11 @@ func Start(ctx context.Context, opt Options) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	stateOwner, err := filelock.Acquire(st.Path() + ".lock")
+	lockPath, err := st.LockPath()
+	if err != nil {
+		return nil, err
+	}
+	stateOwner, err := filelock.Acquire(lockPath)
 	if err != nil {
 		if errors.Is(err, filelock.ErrLocked) {
 			return nil, fmt.Errorf("%w: state %s", ErrOwnerAlive, st.Path())
@@ -85,6 +98,27 @@ func Start(ctx context.Context, opt Options) (*Service, error) {
 			_ = stateOwner.Close()
 		}
 	}()
+
+	// Transitional: a process from before the lock directory holds the OLD
+	// lock name and knows nothing about the new one, so an upgrade in place
+	// could otherwise run two writers against one state file, each holding a
+	// lock the other never looks at. Only an EXISTING EMPTY legacy lock is
+	// eligible: old releases left exactly that behind. Never creating the old
+	// name, and refusing a non-empty file, avoids manufacturing or locking a
+	// different instance's state (for example "foo" and "foo.lock"). Only a
+	// contended legacy lock is fatal; other failures mean the transitional
+	// guarantee is unavailable and the documented stop-before-start rule wins.
+	legacyOwner, legacyErr := filelock.AcquireExistingEmpty(st.LegacyLockPath())
+	if errors.Is(legacyErr, filelock.ErrLocked) {
+		return nil, fmt.Errorf("%w: state %s", ErrOwnerAlive, st.Path())
+	}
+	if legacyOwner != nil {
+		defer func() {
+			if fail {
+				_ = legacyOwner.Close()
+			}
+		}()
+	}
 	if migrateLegacy {
 		manager.MigrateLegacyState(st, manager.LegacyStorePath())
 	}
@@ -117,7 +151,18 @@ func Start(ctx context.Context, opt Options) (*Service, error) {
 		return nil, err
 	}
 
-	svc := &Service{mgr: mgr, ln: ln, stateLock: stateOwner, done: make(chan struct{})}
+	// Before anything can be scheduled: the inbox drain below adds URLs, and
+	// an added URL is scheduled immediately.
+	if err := mgr.SetExtraArgs(opt.ExtraArgs); err != nil {
+		mgr.Close()
+		_ = ln.Close()
+		return nil, fmt.Errorf("downloads.extra_args: %w", err)
+	}
+
+	svc := &Service{
+		mgr: mgr, ln: ln, stateLock: stateOwner, legacyLock: legacyOwner,
+		done: make(chan struct{}),
+	}
 	fail = false
 
 	svc.srv = ipcserver.NewServer(mgr)
@@ -171,6 +216,9 @@ func (s *Service) Close() {
 		}
 		if s.mgr != nil {
 			s.mgr.Close()
+		}
+		if s.legacyLock != nil {
+			_ = s.legacyLock.Close()
 		}
 		if s.stateLock != nil {
 			_ = s.stateLock.Close()

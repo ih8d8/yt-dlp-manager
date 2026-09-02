@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"yt-dlp-manager/internal/ipc"
 )
 
 type Entry struct {
@@ -25,9 +27,58 @@ type Entry struct {
 	Thumbnail string
 }
 
+// Job is one download request: the URL plus whatever per-download overrides
+// were chosen when it was added. It is a struct rather than a widening
+// parameter list so later options do not churn every implementation again.
+type Job struct {
+	URL     string
+	Options ipc.Options
+	// GlobalArgs and ExtraArgs are already-parsed, already-validated free-form
+	// arguments: the ones from Settings that apply to every download, and this
+	// download's own. They are kept apart because they sit on opposite sides
+	// of the picker in the precedence order — see jobArgs.
+	GlobalArgs []string
+	ExtraArgs  []string
+}
+
+// jobArgs renders the option portion of one download's command line, in
+// precedence order — later wins, because that is how yt-dlp resolves an option
+// given twice:
+//
+//  1. the user's yt-dlp config file (not here; yt-dlp reads it itself)
+//  2. global extra arguments from Settings — defaults for every download
+//  3. the picker's choices for this download — deliberately after the global
+//     defaults, since asking for 720p on one item has to beat a blanket
+//     "--format best" typed once in Settings
+//  4. this download's own extra arguments — the last word on everything
+//
+// probeArgs renders the arguments a metadata or format probe may inherit: the
+// network- and identity-shaping subset of both the global and per-download
+// extra arguments, and nothing from the structured picker options, which only
+// describe what to download.
+func probeArgs(job Job) []string {
+	args := append([]string(nil), job.GlobalArgs...)
+	args = append(args, job.ExtraArgs...)
+	return ipc.ProbeSafeArgs(args)
+}
+
+func jobArgs(job Job) []string {
+	args := append([]string(nil), job.GlobalArgs...)
+	args = append(args, OptionArgs(job.Options)...)
+	return append(args, job.ExtraArgs...)
+}
+
 type Runner interface {
-	Probe(ctx context.Context, url string) ([]Entry, error)
-	Run(ctx context.Context, url string, onLine func(string)) (tail string, err error)
+	Probe(ctx context.Context, job Job) ([]Entry, error)
+	Run(ctx context.Context, job Job, onLine func(string)) (tail string, err error)
+}
+
+// FormatLister is an optional capability: a runner that can enumerate the
+// formats a URL offers. It is deliberately not part of Runner so the many
+// fake runners in tests are not forced to implement a probe they never use;
+// callers type-assert and report the feature as unavailable otherwise.
+type FormatLister interface {
+	Formats(ctx context.Context, job Job) (*FormatProbe, error)
 }
 
 const (
@@ -36,6 +87,20 @@ const (
 	stderrTailSize = 30
 	maxProbeStdout = 64 << 20
 	maxProbeStderr = 1 << 20
+	// maxFormatStdout bounds a format probe separately from a playlist probe:
+	// one video's format table is orders of magnitude smaller than a
+	// playlist's entry list, and this output is parsed into a response body.
+	maxFormatStdout = 8 << 20
+	// MaxFormats bounds how many formats one probe reports. A picker is
+	// unusable past a few dozen entries and the cap keeps an extractor with a
+	// pathological format table from filling a response.
+	MaxFormats = 400
+	// FormatProbeTimeout bounds a format probe END TO END, including the wait
+	// for a free slot. It is deliberately shorter than the HTTP server's write
+	// timeout: a probe allowed to outlive that would have its documented
+	// timeout response discarded, and the caller would see a dropped
+	// connection instead of an explanation.
+	FormatProbeTimeout = 20 * time.Second
 	// MaxPlaylistEntries bounds how many entries one playlist probe can turn
 	// into. The 64 MiB stdout cap alone is not a bound on memory or on the
 	// queue: at ~200 bytes per flat-playlist line it still permits hundreds of
@@ -71,7 +136,8 @@ func (b *cappedBuffer) String() string { return b.buf.String() }
 
 type YtdlpRunner struct{}
 
-func (YtdlpRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
+func (YtdlpRunner) Probe(ctx context.Context, job Job) ([]Entry, error) {
+	url := job.URL
 	args := []string{
 		"--quiet", "--no-warnings", "--color", "no_color",
 		"--flat-playlist",
@@ -80,8 +146,14 @@ func (YtdlpRunner) Probe(ctx context.Context, url string) ([]Entry, error) {
 		// containing "|" shifted every later field, and a title containing a
 		// newline forged an entire extra entry — with an attacker-chosen URL.
 		"--print", "@e|" + entryFieldsTemplate,
-		"--", url,
 	}
+	// A probe talks to the same site as the download, so it inherits how to
+	// reach it — but only that. Options that select or limit what gets
+	// downloaded change a probe's exit status instead of helping it
+	// (--max-downloads makes yt-dlp exit 101 after printing), so they are
+	// filtered out rather than forwarded wholesale.
+	args = append(args, probeArgs(job)...)
+	args = append(args, "--", url)
 	cmd := exec.Command("yt-dlp", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr cappedBuffer
@@ -186,14 +258,24 @@ func parseProbeOutput(out, original string) []Entry {
 	return entries
 }
 
-func (YtdlpRunner) Run(ctx context.Context, url string, onLine func(string)) (string, error) {
+func (YtdlpRunner) Run(ctx context.Context, job Job, onLine func(string)) (string, error) {
 	args := []string{
 		"--quiet", "--no-warnings", "--color", "no_color",
 		"--progress", "--newline", "--progress-delta", "0.1",
 		// total_bytes is present for plain HTTP/generic downloads while
 		// total_bytes_estimate covers streaming formats; the comma syntax
 		// makes yt-dlp fall back to the second when the first is NA.
-		"--progress-template", "download:@p|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s",
+		//
+		// status and format_id are what make the byte counters add up. One
+		// item is routinely several downloads (a video stream, then an audio
+		// stream, then subtitles), and each one restarts downloaded_bytes at
+		// zero with its own total — so the last stream's numbers used to be
+		// the only ones left on the item: "7.2 MB / 7.2 MB" for a 134 MB
+		// file. The extra fields let the reader tell one stream's end from
+		// the next stream's start and accumulate instead of overwrite.
+		// format_id is JSON-encoded and placed last: it comes from a remote
+		// extractor, so it must not be able to shift the fields before it.
+		"--progress-template", "download:@p|%(progress.downloaded_bytes)s|%(progress.total_bytes,progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s|%(progress.status)s|%(info.format_id)j",
 		// JSON-encoded ("j"), not raw. %(title)s is remote-controlled text on
 		// the SAME stdout stream that carries the "@f|"/"@g|" file records, so
 		// a title containing a newline used to emit a second protocol line of
@@ -201,9 +283,20 @@ func (YtdlpRunner) Run(ctx context.Context, url string, onLine func(string)) (st
 		// then act on.
 		"--print", "before_dl:@t|%(title)j",
 		"--print", "before_dl:@f|%(filename)j",
+		// The combined size of every stream this download will fetch, known
+		// before the first byte. Without it the percentage can only be
+		// measured against the stream in flight, so finishing the video and
+		// starting the audio made the bar fall backwards. filesize is exact
+		// where an extractor provides it; filesize_approx is the sum of the
+		// requested formats' estimates and is what YouTube actually reports.
+		"--print", "before_dl:@n|%(filesize,filesize_approx)s",
 		"--print", "after_move:@g|%(filepath)j",
-		"--", url,
 	}
+	// Everything here goes on the command line, which yt-dlp gives priority
+	// over its own configuration file — so what was chosen for this item beats
+	// the defaults, and anything nobody chose still comes from the config.
+	args = append(args, jobArgs(job)...)
+	args = append(args, "--", job.URL)
 	cmd := exec.Command("yt-dlp", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()

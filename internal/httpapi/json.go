@@ -22,6 +22,7 @@ const (
 	codeInvalidJSON      = "invalid_json"
 	codeInvalidURL       = "invalid_url"
 	codeDuplicateURL     = "duplicate_url"
+	codeInvalidOptions   = "invalid_options"
 	codeInvalidState     = "invalid_state"
 	codeNotFound         = "not_found"
 	codeUnauthorized     = "unauthorized"

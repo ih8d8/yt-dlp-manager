@@ -26,3 +26,11 @@ The default Compose deployment binds to loopback. Remote deployments should
 terminate TLS at a reverse proxy, set `YTDLP_MANAGER_SECURE_COOKIE=true`, and
 keep authentication enabled. Plain-HTTP LAN exposure is not considered a
 secure production configuration.
+
+Behind a proxy, `YTDLP_MANAGER_TRUSTED_PROXIES` may optionally name that
+proxy's address. Login rate limiting otherwise sees only the proxy and puts
+every client in one backoff bucket, so one person's failed guesses briefly
+delay everyone's sign-in. The backoff is capped at a minute, so this is a
+nuisance rather than a lockout and the setting is not required. Set it only for
+proxies you run, and only if yours overwrites `X-Forwarded-For` rather than
+appending to a client-supplied value.

@@ -43,12 +43,13 @@ var allowedImageTypes = map[string]struct{}{
 	"image/webp": {},
 }
 
-// downloadIDRe is the shape the manager mints (8 lowercase hex characters),
-// with headroom for a longer future format. It exists because item ids reach
-// the filesystem: http.ServeMux matches on the ESCAPED path and unescapes only
-// the captured segment, so "%2F" survives routing and becomes a real separator
-// inside PathValue. Without this guard filepath.Join walks straight out of the
-// state directory.
+// downloadIDRe accepts both the original 8-character IDs already persisted by
+// older releases and the 32-character IDs minted now, with headroom for a
+// longer future format. It exists because item ids reach the filesystem:
+// http.ServeMux matches on the ESCAPED path and unescapes only the captured
+// segment, so "%2F" survives routing and becomes a real separator inside
+// PathValue. Without this guard filepath.Join walks straight out of the state
+// directory.
 var downloadIDRe = regexp.MustCompile(`^[0-9a-f]{8,64}$`)
 
 func validDownloadID(id string) bool { return downloadIDRe.MatchString(id) }

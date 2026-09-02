@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,14 @@ import (
 	"yt-dlp-manager/internal/config"
 	"yt-dlp-manager/internal/ipc"
 )
+
+// ErrOptionsInvalid refuses to re-run a row whose saved per-download options
+// could not be read back. Running it would quietly substitute today's defaults
+// for the quality, container or arguments that were actually requested, which
+// is a different download in the same row. Removing and re-adding the URL is
+// the way forward, and it is one click either way.
+var ErrOptionsInvalid = errors.New(
+	"this download's saved options could not be read; remove it and add the URL again")
 
 var (
 	ErrNotFound     = errors.New("no such item")
@@ -35,14 +44,102 @@ var (
 		"remove finished downloads to make room", MaxQueueItems)
 )
 
-// MaxQueueItems bounds how many entries the manager tracks at once. Without a
-// ceiling, a handful of large playlists can grow the queue until the snapshot
-// no longer fits maxStateBytes — at which point every save fails and the whole
-// history is lost, rather than one addition being refused here.
-const MaxQueueItems = 20000
+// Bounds on what one item can weigh, and on how many there can be.
+//
+// These are what make persistence safe, and they are enforced at admission
+// rather than hoped for afterwards. Trimming finished history is a safety net
+// for state written by an older build; it cannot be the guarantee, because a
+// queue can be entirely live — 5000 queued playlist children owe nothing to
+// history, and there would be nothing expendable to drop.
+//
+// MaxItemBytes is measured on the SERIALIZED item, not on its characters: a
+// character of UTF-8 can be four bytes and quotes and backslashes still escape,
+// so a bound expressed in characters says little about the bytes on disk.
+const (
+	// MaxItemBytes is the ceiling on one row's JSON, and it holds for the
+	// row's WHOLE life, not just at admission. Every bound below is expressed
+	// in ENCODED bytes rather than characters, because bytes are what the
+	// state file spends: one character of UTF-8 can be four of them, and
+	// quotes and backslashes still escape.
+	//
+	// Because each field is individually bounded in bytes and the bounds sum
+	// to less than MaxItemBytes, no later mutation — a title arriving from
+	// stdout, a recorded path, an error, timestamps — can push an admitted row
+	// over. TestFieldBoundsFitTheItemBudget pins that sum.
+	MaxItemBytes = 12 << 10
+
+	// The URL and options are the caller's; an entry that cannot hold them is
+	// refused rather than truncated.
+	MaxURLBytes     = 2048
+	MaxOptionsBytes = 1024
+	// Everything else is truncated to fit, because losing the tail of a
+	// display string beats being unable to store the row at all.
+	MaxTitleBytes    = 512
+	MaxThumbURLBytes = 1024
+	MaxFilePathBytes = 1024
+	MaxErrorBytes    = 512
+	// MaxFilesPerItem bounds recorded output paths. A download records its
+	// predicted name, its final path and any sidecar files; a handful is
+	// normal and cleanup only needs those.
+	MaxFilesPerItem = 6
+	// itemFixedBytes covers ids, states, timestamps, field names and
+	// punctuation — everything not bounded above.
+	itemFixedBytes = 512
+)
+
+// encodedLen is the number of bytes a string costs inside the snapshot.
+func encodedLen(s string) int {
+	b, err := ipc.MarshalNoHTMLEscape(s)
+	if err != nil {
+		return MaxItemBytes + 1
+	}
+	return len(b)
+}
+
+// truncateEncoded shortens s until its JSON encoding fits max bytes, keeping
+// as much as possible and cutting only on rune boundaries.
+//
+// It trims by the measured overshoot rather than halving. Halving threw away
+// half a field to save two bytes: a 511-character title costs 513 encoded
+// bytes against a 512 budget, and used to come back 255 characters long.
+func truncateEncoded(s string, max int) string {
+	if max < 2 { // not even room for the surrounding quotes
+		return ""
+	}
+	for {
+		n := encodedLen(s)
+		if n <= max {
+			return s
+		}
+		// Every byte encodes to at least itself, so cutting the overshoot in
+		// raw bytes removes at least that much encoded. This converges in one
+		// or two passes rather than discarding half the value.
+		cut := len(s) - (n - max)
+		if cut < 0 {
+			cut = 0
+		}
+		next := truncate(s, cut)
+		if next == s { // truncate walked back to the same rune boundary
+			next = truncate(s, cut-1)
+		}
+		s = next
+		if s == "" {
+			return ""
+		}
+	}
+}
+
+// MaxQueueItems bounds how many entries the manager tracks at once.
+//
+// It is chosen against MaxItemBytes and the state limit so that a full queue —
+// every row live, every row at its maximum size — still fits in a snapshot
+// that Load will accept. TestQueueAlwaysFitsTheStateLimit pins the arithmetic;
+// raising either constant without the other will fail it.
+const MaxQueueItems = 5000
 
 // DuplicateError reports an Add rejected because a live entry already holds
-// the same URL. It names that entry so callers can point at it.
+// the same URL — whatever options accompanied it. It names that entry so
+// callers can point at it.
 type DuplicateError struct {
 	ID    string
 	State ipc.State
@@ -50,7 +147,13 @@ type DuplicateError struct {
 
 func (e *DuplicateError) Error() string {
 	if e.State == ipc.StateCompleted {
-		return "this URL has already been downloaded and is in your library; remove that entry to download it again"
+		// Removing the row deliberately keeps the media, so saying only
+		// "remove that entry" would send the user into a second surprise:
+		// with the same output template yt-dlp finds the existing file and
+		// skips, and the new row reports a quality it never fetched.
+		return "this URL is already downloaded and in your library. To fetch it again, " +
+			"remove that entry AND move or delete its file — or give your output template " +
+			"a format-specific field such as %(format_id)s so the two cannot collide"
 	}
 	return fmt.Sprintf("this URL is already in the queue (%s)", e.State)
 }
@@ -66,6 +169,32 @@ type item struct {
 	stop      string
 	remove    bool
 	lastPush  time.Time
+
+	// Byte accounting across the several downloads that make up one item.
+	// yt-dlp downloads a video stream and an audio stream as separate
+	// transfers and restarts its progress counters at zero for each, so the
+	// reported numbers have to be accumulated rather than assigned: doneBytes
+	// holds the streams that already finished, curGot/curTotal the one in
+	// flight, and curKey the format id that identifies it. All are guarded by
+	// m.mu and are deliberately not persisted — after a restart the resumed
+	// stream is the only one this process can honestly account for, and a
+	// finished download has its size taken from disk anyway.
+	// sawOutput records that yt-dlp named an output file, independently of
+	// whether the path was short enough to store. The two are different
+	// questions, and conflating them turned a successful download with an
+	// unusually long filename into a false failure.
+	sawOutput bool
+
+	doneBytes int64
+	curKey    string
+	curGot    int64
+	curTotal  int64
+	// expectTotal is the combined size of every stream this download will
+	// fetch, reported once before the first byte. It is what lets the
+	// percentage measure the whole item instead of the stream in flight, so
+	// the bar no longer falls backwards when the video ends and the audio
+	// begins. Zero means the extractor did not report one.
+	expectTotal int64
 }
 
 type Manager struct {
@@ -74,6 +203,11 @@ type Manager struct {
 	max       int
 	store     *Store
 	runner    Runner
+
+	// extraArgs are the global free-form yt-dlp arguments from Settings,
+	// parsed and validated once when they are set rather than per download.
+	// Guarded by mu.
+	extraArgs []string
 
 	mu sync.Mutex
 	// publishMu serializes overflow recovery, where a stale subscriber
@@ -93,17 +227,28 @@ type Manager struct {
 	removedAt map[string]uint64
 	closing   bool
 
+	// Format probes are user-triggered, so they get their own small
+	// concurrency ceiling and cache rather than sharing the download queue's.
+	fmtSem chan struct{}
+	fmtMu  sync.Mutex
+	// Entries are keyed by URL AND by the probe arguments that produced them,
+	// so results from one request context can never be served for another.
+	fmtCache map[string]formatCacheEntry
+
 	dirty     chan struct{}
 	saverStop chan struct{}
 	saverDone chan struct{}
 
 	// Last persistence outcome, read by SaveError (and so by /readyz) from
 	// goroutines other than the saver.
-	saveErrMu    sync.Mutex
-	saveErr      error
-	shutdownOnce sync.Once
-	closeDone    chan struct{}
-	wg           sync.WaitGroup
+	saveErrMu sync.Mutex
+	saveErr   error
+	// persistDisabled stops all writing when saving would destroy the only
+	// remaining copy of data the manager could not restore.
+	persistDisabled bool
+	shutdownOnce    sync.Once
+	closeDone       chan struct{}
+	wg              sync.WaitGroup
 }
 
 func New(ctx context.Context, max int, storePath string) (*Manager, error) {
@@ -130,6 +275,8 @@ func newManager(ctx context.Context, max int, storePath string, r Runner) (*Mana
 		runner:    r,
 		items:     make(map[string]*item),
 		subs:      make(map[chan ipc.Event]struct{}),
+		fmtSem:    make(chan struct{}, maxConcurrentFormatProbes),
+		fmtCache:  make(map[string]formatCacheEntry),
 		dirty:     make(chan struct{}, 1),
 		closeDone: make(chan struct{}),
 	}
@@ -144,12 +291,50 @@ func newManager(ctx context.Context, max int, storePath string, r Runner) (*Mana
 func (m *Manager) restore() {
 	snap, err := m.store.Load()
 	if err != nil {
-		if !errors.Is(err, ErrNoState) {
-			if target := m.store.Quarantine(); target != "" {
-				fmt.Fprintf(os.Stderr, "yt-dlp-manager: unreadable state moved to %s\n", target)
-			}
+		if errors.Is(err, ErrNoState) {
+			return
 		}
+		target, qerr := m.store.Quarantine()
+		if qerr != nil {
+			// The unreadable file is still the only copy of whatever it
+			// holds. Starting empty is fine; overwriting it is not, so
+			// saving stops and readiness says so.
+			m.disablePersistence(fmt.Errorf(
+				"state unreadable (%v) and not movable (%v); not saving", err, qerr))
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: %v\n", m.SaveError())
+			return
+		}
+		fmt.Fprintf(os.Stderr, "yt-dlp-manager: unreadable state moved to %s\n", target)
 		return
+	}
+	pruned := len(snap.Dropped) > 0
+	if pruned {
+		// Rows are about to exist only in memory, and the reduced snapshot
+		// will overwrite the file they came from. Preserve the original FIRST,
+		// by rename, so the pre-migration state survives whatever happens
+		// next. A rename needs no free space and no new filename length that
+		// the old one did not already have.
+		backup, berr := m.store.PreserveCurrent()
+		where, derr := m.store.SaveDropped(snap.Dropped)
+
+		switch {
+		case berr == nil && derr == nil:
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: %d entries not restored; kept in %s and %s\n",
+				len(snap.Dropped), backup, where)
+		case berr == nil:
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: %d entries not restored; kept in %s (%v)\n",
+				len(snap.Dropped), backup, derr)
+		case derr == nil:
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: %d entries not restored; kept in %s (%v)\n",
+				len(snap.Dropped), where, berr)
+		default:
+			// No copy could be made, so writing would destroy the only one.
+			// URLs stay out of the log: they can carry tokens.
+			m.disablePersistence(fmt.Errorf(
+				"%d entries not restored and no copy could be written (%v; %v); not saving",
+				len(snap.Dropped), berr, derr))
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: %v\n", m.SaveError())
+		}
 	}
 	now := time.Now()
 	for _, it := range snap.Items {
@@ -209,6 +394,18 @@ func (m *Manager) restore() {
 		if _, ok := ordered[id]; it.State == ipc.StateQueued && !ok {
 			m.order = append(m.order, id)
 			ordered[id] = struct{}{}
+		}
+	}
+
+	// Renaming the original away leaves no primary state file. Write the
+	// reduced snapshot NOW rather than waiting for the next mutation: a crash
+	// in between would otherwise start the next run from no state at all — or
+	// from stale legacy state — which is a worse outcome than the pruning it
+	// came from. A failure here is recorded, so readiness stops claiming the
+	// queue is persisted.
+	if pruned && !m.persistenceDisabled() {
+		if !m.flush() {
+			fmt.Fprintf(os.Stderr, "yt-dlp-manager: pruned queue not written: %v\n", m.SaveError())
 		}
 	}
 }
@@ -284,8 +481,19 @@ func (m *Manager) saver() {
 // that never reached disk has to be visible to /readyz, not just to whoever
 // happens to be reading stderr.
 func (m *Manager) flush() bool {
+	if m.persistenceDisabled() {
+		// Refusing on purpose; the reason is already in saveErr and on the log.
+		return false
+	}
 	items, order := m.snapshotRaw()
-	err := m.store.Save(items, order)
+	trimmed, err := m.store.SaveTrimmed(items, order)
+	// Rows the snapshot could not hold are dropped from memory too, so what
+	// the UI shows and what a restart would restore stay the same thing.
+	if len(trimmed) > 0 {
+		m.dropTrimmedHistory(trimmed)
+		fmt.Fprintf(os.Stderr, "yt-dlp-manager: state at its size limit: trimmed %d oldest entries\n",
+			len(trimmed))
+	}
 	m.saveErrMu.Lock()
 	prev := m.saveErr
 	m.saveErr = err
@@ -301,6 +509,54 @@ func (m *Manager) flush() bool {
 		fmt.Fprintf(os.Stderr, "yt-dlp-manager: save state: recovered, queue persisted\n")
 	}
 	return true
+}
+
+// dropTrimmedHistory removes rows the store could not fit, and tells
+// subscribers, so nothing lingers in a UI that a restart would not bring back.
+func (m *Manager) dropTrimmedHistory(ids []string) {
+	m.mu.Lock()
+	gone := make([]string, 0, len(ids))
+	for _, id := range ids {
+		it, ok := m.items[id]
+		if !ok {
+			continue
+		}
+		// Re-check under the lock, against the SAME rule the trimming selector
+		// uses. The snapshot was taken before a save that can take a while,
+		// and the user may have retried the row in the meantime: it is queued
+		// or downloading now, with a yt-dlp process possibly writing files.
+		// Removing it here would delete a live download's row out from under
+		// it. Only completed rows are expendable; anything else stays, and the
+		// next save simply reconsiders it.
+		if it.State != ipc.StateCompleted {
+			continue
+		}
+		m.removeItemLocked(it)
+		gone = append(gone, id)
+	}
+	m.mu.Unlock()
+	for _, id := range gone {
+		m.publish(0, ipc.Event{Event: "removed", ID: id})
+	}
+}
+
+// persistenceDisabled reports whether saving has been stopped to protect the
+// last remaining copy of unrestorable rows.
+func (m *Manager) persistenceDisabled() bool {
+	m.saveErrMu.Lock()
+	defer m.saveErrMu.Unlock()
+	return m.persistDisabled
+}
+
+// disablePersistence stops the saver from writing, permanently for this
+// process, and records why. It is used when writing would destroy the only
+// remaining copy of something: continuing to run is fine, continuing to
+// overwrite is not.
+func (m *Manager) disablePersistence(reason error) {
+	m.saveErrMu.Lock()
+	m.persistDisabled = true
+	m.saveErr = reason
+	m.saveErrMu.Unlock()
 }
 
 // SaveError returns the error from the most recent attempt to persist the
@@ -441,7 +697,13 @@ func (m *Manager) push(it *item) {
 var randomRead = rand.Read
 
 func newID() (string, error) {
-	var b [4]byte
+	// IDs outlive queue rows: cached thumbnails and delayed removal events can
+	// still refer to an old value after the row itself is gone. Four random
+	// bytes made a historical reuse likely after only ~77,000 generated IDs
+	// (the birthday bound), so a long-running installation could attach stale
+	// state to an unrelated new download. Sixteen bytes makes reuse negligible
+	// while staying comfortably inside the API's 64-hex-character limit.
+	var b [16]byte
 	if _, err := randomRead(b[:]); err != nil {
 		return "", err
 	}
@@ -531,7 +793,15 @@ func blocksDuplicate(s ipc.State) bool {
 // URL: the case this guards is an accidental re-paste, and guessing that two
 // differently-spelled URLs name the same video is the extractor's job, not
 // ours. Caller must hold m.mu.
-func (m *Manager) findDuplicateLocked(rawURL, exclude string) *DuplicateError {
+// Identity is the URL alone, deliberately, and NOT the URL plus its options.
+// Allowing the same URL at two qualities sounds harmless, but yt-dlp's output
+// template decides the filename and rarely varies by format, so both rows
+// resolve to one file: the second silently overwrites the first, or sees it
+// and skips — leaving a row that claims a quality it does not hold. Nothing
+// here can make the destinations unique without overriding the operator's own
+// output template, so the safe rule is one live entry per URL. To fetch
+// another quality, remove the existing entry first.
+func (m *Manager) findDuplicateLocked(rawURL string, opts ipc.Options, exclude string) *DuplicateError {
 	for id, it := range m.items {
 		if id == exclude {
 			continue
@@ -541,6 +811,22 @@ func (m *Manager) findDuplicateLocked(rawURL, exclude string) *DuplicateError {
 		}
 	}
 	return nil
+}
+
+// runningURLsLocked is the set of URLs a download is already running for.
+//
+// It is gathered ONCE per scheduling pass rather than rescanned per candidate:
+// the scheduler walks every queued row on every state change, and a per-row
+// scan made that quadratic — 25 million comparisons for a full queue, on every
+// completed download. Caller must hold m.mu.
+func (m *Manager) runningURLsLocked() map[string]struct{} {
+	running := make(map[string]struct{}, m.nrun)
+	for _, it := range m.items {
+		if it.State == ipc.StateDownloading {
+			running[it.URL] = struct{}{}
+		}
+	}
+	return running
 }
 
 // blockingURLsLocked is findDuplicateLocked's bulk form: the set of URLs that
@@ -557,18 +843,61 @@ func (m *Manager) blockingURLsLocked(exclude string) map[string]struct{} {
 	return urls
 }
 
+// Add queues a URL with no per-download overrides, so every choice comes from
+// the user's yt-dlp configuration.
 func (m *Manager) Add(rawURL string) (string, error) {
+	return m.AddWithOptions(rawURL, ipc.Options{})
+}
+
+// AddWithOptions queues a URL with overrides that take priority over the
+// configuration file for this item only. The options are stored on the item,
+// so a retry, a resume, or a restart downloads what was originally asked for
+// rather than silently falling back to the defaults.
+// itemBytes is one row's serialized size, which is what the state file
+// actually spends on it.
+func itemBytes(it ipc.Item) int {
+	b, err := ipc.MarshalNoHTMLEscape(it)
+	if err != nil {
+		// Unreachable for a struct of strings and numbers; treat as oversized
+		// rather than admitting something that cannot be written.
+		return MaxItemBytes + 1
+	}
+	// Plus its id in the order array and the separators around both.
+	return len(b) + len(it.ID) + 4
+}
+
+// ErrItemTooLarge refuses a row that would not fit the per-item budget. In
+// practice this needs a pathological URL: a realistic row is a few hundred
+// bytes against a 12 KiB ceiling.
+var ErrItemTooLarge = fmt.Errorf(
+	"this URL and its options serialize to more than %d bytes, which the queue cannot store",
+	MaxItemBytes)
+
+func (m *Manager) AddWithOptions(rawURL string, opts ipc.Options) (string, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if !ValidURL(rawURL) {
 		return "", errors.New("invalid url")
 	}
-	it := &item{Item: ipc.Item{State: ipc.StateQueued, AddedAt: time.Now()}}
+	opts = opts.Normalize()
+	if err := opts.Validate(); err != nil {
+		return "", err
+	}
+	it := &item{Item: ipc.Item{
+		URL: rawURL, State: ipc.StateQueued, AddedAt: time.Now(), Options: opts,
+	}}
+	// Checked before the row exists, so the queue can never hold something the
+	// snapshot cannot. Only the caller's own fields are measured here: every
+	// field that arrives later is bounded in bytes at its own ingestion point,
+	// and the bounds are chosen to fit alongside these.
+	if encodedLen(rawURL) > MaxURLBytes || encodedLen(opts.Key()) > MaxOptionsBytes {
+		return "", ErrItemTooLarge
+	}
 	m.mu.Lock()
 	if m.closing || m.ctx.Err() != nil {
 		m.mu.Unlock()
 		return "", ErrShuttingDown
 	}
-	if dup := m.findDuplicateLocked(rawURL, ""); dup != nil {
+	if dup := m.findDuplicateLocked(rawURL, opts, ""); dup != nil {
 		m.mu.Unlock()
 		return "", dup
 	}
@@ -582,7 +911,6 @@ func (m *Manager) Add(rawURL string) (string, error) {
 		return "", fmt.Errorf("generate item id: %w", err)
 	}
 	it.ID = id
-	it.URL = rawURL
 	m.items[it.ID] = it
 	m.order = append(m.order, it.ID)
 	m.mu.Unlock()
@@ -596,7 +924,19 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 	defer m.wg.Done()
 	url := it.URL
 
-	entries, perr := m.runner.Probe(ctx, url)
+	// The probe reaches the same site the download will, so it needs the same
+	// proxy, headers, impersonation and extractor arguments. Without them a
+	// download that only works behind a proxy fails during probing and never
+	// reaches Run, where those arguments would finally have been applied.
+	m.mu.Lock()
+	probeJob := Job{
+		URL:        url,
+		Options:    it.Options,
+		GlobalArgs: append([]string(nil), m.extraArgs...),
+		ExtraArgs:  itemExtraArgs(it.Options),
+	}
+	m.mu.Unlock()
+	entries, perr := m.runner.Probe(ctx, probeJob)
 
 	m.mu.Lock()
 	if _, live := m.items[it.ID]; !live {
@@ -641,7 +981,7 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 		m.touch()
 	case perr != nil:
 		it.State = ipc.StateFailed
-		it.Error = truncate(sanitize(strings.TrimSpace(perr.Error())), 300)
+		it.Error = truncateEncoded(sanitize(strings.TrimSpace(perr.Error())), MaxErrorBytes)
 		done := time.Now()
 		it.DoneAt = &done
 		cp := it.Item
@@ -660,8 +1000,8 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 		m.publish(seq, ipc.Event{Event: "update", Item: &cp})
 		m.touch()
 	case len(entries) == 1:
-		it.Title = sanitize(entries[0].Title)
-		it.ThumbURL = sanitize(entries[0].Thumbnail)
+		it.Title = truncateEncoded(sanitize(entries[0].Title), MaxTitleBytes)
+		it.ThumbURL = truncateEncoded(sanitize(entries[0].Thumbnail), MaxThumbURLBytes)
 		cp := it.Item
 		seq := m.stampLocked()
 		m.mu.Unlock()
@@ -716,7 +1056,7 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 					delete(m.items, child.ID)
 				}
 				it.State = ipc.StateFailed
-				it.Error = truncate(sanitize("generate playlist item id: "+err.Error()), 300)
+				it.Error = truncateEncoded(sanitize("generate playlist item id: "+err.Error()), MaxErrorBytes)
 				done := time.Now()
 				it.DoneAt = &done
 				cp := it.Item
@@ -731,11 +1071,22 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 			child := &item{probed: true, Item: ipc.Item{
 				ID:       id,
 				URL:      childURL,
-				Title:    sanitize(e.Title),
-				ThumbURL: sanitize(e.Thumbnail),
+				Title:    truncateEncoded(sanitize(e.Title), MaxTitleBytes),
+				ThumbURL: truncateEncoded(sanitize(e.Thumbnail), MaxThumbURLBytes),
 				State:    ipc.StateQueued,
 				AddedAt:  added,
+				Options:  it.Options,
 			}}
+			// The same sub-budgets every other row is held to. Checking the
+			// child's current total is not enough: a sparse row can be under
+			// the item budget today and grow past it once its bounded title,
+			// paths and error arrive, because those bounds are only additive
+			// on top of a URL that itself stayed within MaxURLBytes.
+			if encodedLen(childURL) > MaxURLBytes ||
+				encodedLen(it.Options.Key()) > MaxOptionsBytes {
+				dropped++
+				continue
+			}
 			m.items[child.ID] = child
 			children = append(children, child)
 		}
@@ -821,6 +1172,7 @@ func (m *Manager) schedule() {
 		return
 	}
 	kept := m.order[:0]
+	running := m.runningURLsLocked()
 	for _, id := range m.order {
 		it, ok := m.items[id]
 		if !ok || it.remove {
@@ -842,11 +1194,23 @@ func (m *Manager) schedule() {
 			kept = append(kept, id)
 			continue
 		}
+		// Add refuses a URL a live entry already holds, but failed and deleted
+		// rows deliberately do NOT reserve theirs — that is what allows a
+		// re-add — so a retry can still produce two rows for one URL. They
+		// must not DOWNLOAD at the same time: both processes would write the
+		// same file and fight over the same ".part" intermediates. The second
+		// waits its turn instead. Metadata probes are unaffected; they touch
+		// no files.
+		if _, busy := running[it.URL]; busy {
+			kept = append(kept, id)
+			continue
+		}
 		if m.hasCapacityLocked(it.Forced) {
 			m.nrun++
 			ctx, cancel := context.WithCancel(m.ctx)
 			it.cancel = cancel
 			it.State = ipc.StateDownloading
+			running[it.URL] = struct{}{} // claim it for the rest of this pass
 			jobs = append(jobs, startJob{it: it, ctx: ctx, cancel: cancel})
 			updates = append(updates, snap{item: it.Item, seq: m.stampLocked()})
 			continue
@@ -876,12 +1240,24 @@ func (m *Manager) run(it *item, ctx context.Context, cancel context.CancelFunc) 
 	it.StartedAt = &started
 	it.Error = ""
 	url := it.URL
+	opts := it.Options
+	// Kept apart rather than concatenated: the global ones precede the
+	// picker's choices and this item's own follow them. See jobArgs.
+	globalArgs := append([]string(nil), m.extraArgs...)
+	extra := itemExtraArgs(opts)
+	// A retry reuses the item, so the byte accounting from the previous
+	// attempt must not be carried into this one.
+	it.doneBytes, it.curGot, it.curTotal, it.curKey = 0, 0, 0, ""
+	it.expectTotal = 0
+	it.sawOutput = false
 	cp := it.Item
 	seq := m.stampLocked()
 	m.mu.Unlock()
 	m.publish(seq, ipc.Event{Event: "update", Item: &cp})
 
-	tail, exitErr := m.runner.Run(ctx, url, func(line string) { m.onLine(it, line) })
+	tail, exitErr := m.runner.Run(ctx,
+		Job{URL: url, Options: opts, GlobalArgs: globalArgs, ExtraArgs: extra},
+		func(line string) { m.onLine(it, line) })
 	cancel()
 
 	m.mu.Lock()
@@ -911,7 +1287,7 @@ func (m *Manager) run(it *item, ctx context.Context, cancel context.CancelFunc) 
 		if cleanupErr != nil && stillLive {
 			it.remove = false
 			it.State = ipc.StateFailed
-			it.Error = truncate(sanitize("cleanup: "+cleanupErr.Error()), 300)
+			it.Error = truncateEncoded(sanitize("cleanup: "+cleanupErr.Error()), MaxErrorBytes)
 			cp := it.Item
 			seq := m.stampLocked()
 			m.mu.Unlock()
@@ -930,8 +1306,49 @@ func (m *Manager) run(it *item, ctx context.Context, cancel context.CancelFunc) 
 		}
 		m.touch()
 	case exitErr == nil:
+		it.rollStreamLocked()
+		id := it.ID
+		files := append([]string(nil), it.Files...)
+		if !it.sawOutput {
+			// yt-dlp exited 0 without ever naming an output. That is not a
+			// download: options that skip one (a non-matching --match-filters,
+			// for instance) exit 0 silently, and calling this "completed"
+			// would put a row in the library with no media behind it. An
+			// output that already existed still reports its path, so this does
+			// not catch the ordinary "already downloaded" case.
+			it.State = ipc.StateFailed
+			it.Error = "yt-dlp finished without downloading anything (the download was " +
+				"skipped, or produced no output file)"
+			cp := it.Item
+			seq := m.stampLocked()
+			m.mu.Unlock()
+			m.publish(seq, ipc.Event{Event: "update", Item: &cp})
+			m.touch()
+			m.schedule()
+			return
+		}
 		it.State = ipc.StateCompleted
 		it.Progress = 100
+		m.mu.Unlock()
+		// Stat outside the lock, then re-check the row still exists: it can
+		// be removed while the filesystem is being asked.
+		size := diskSize(files)
+		m.mu.Lock()
+		if _, stillLive := m.items[id]; !stillLive {
+			// The row was removed while the filesystem was being asked. Its
+			// removal has already been published, and this update carries a
+			// NEWER sequence number, so publishing it would slip past the
+			// tombstone check and resurrect a completed ghost row in every
+			// connected UI until the next reconnect.
+			m.mu.Unlock()
+			m.touch()
+			m.schedule()
+			return
+		}
+		if size > 0 {
+			it.Got = size
+			it.Total = size
+		}
 		cp := it.Item
 		seq := m.stampLocked()
 		m.mu.Unlock()
@@ -951,9 +1368,9 @@ func (m *Manager) run(it *item, ctx context.Context, cancel context.CancelFunc) 
 		default:
 			it.State = ipc.StateFailed
 			if t := strings.TrimSpace(tail); t != "" {
-				it.Error = truncate(sanitize(t), 300)
+				it.Error = truncateEncoded(sanitize(t), MaxErrorBytes)
 			} else {
-				it.Error = truncate(sanitize(exitErr.Error()), 300)
+				it.Error = truncateEncoded(sanitize(exitErr.Error()), MaxErrorBytes)
 			}
 		}
 		cp := it.Item
@@ -968,7 +1385,11 @@ func (m *Manager) run(it *item, ctx context.Context, cancel context.CancelFunc) 
 func (m *Manager) onLine(it *item, line string) {
 	switch {
 	case strings.HasPrefix(line, "@p|"):
-		f := strings.SplitN(strings.TrimPrefix(line, "@p|"), "|", 5)
+		// Seven fields since the progress template gained status and format
+		// id. Everything past the fourth stays optional: a shorter line is
+		// still parsed, which keeps the reader working against an older
+		// yt-dlp and against the simpler lines the tests' fake runners emit.
+		f := strings.SplitN(strings.TrimPrefix(line, "@p|"), "|", 7)
 		if len(f) < 4 {
 			return
 		}
@@ -977,16 +1398,40 @@ func (m *Manager) onLine(it *item, line string) {
 		speed := ParseNum(f[2])
 		eta := ParseNum(f[3])
 		reportedProgress := -1.0
-		if len(f) == 5 {
+		if len(f) >= 5 {
 			reportedProgress = parsePercent(f[4])
+		}
+		status := ""
+		if len(f) >= 6 {
+			status = strings.TrimSpace(f[5])
+		}
+		streamKey := ""
+		if len(f) >= 7 {
+			// Decoded, never taken raw: the format id comes from a remote
+			// extractor. A value that did not arrive JSON-encoded is simply
+			// not used as a key, which costs nothing but the fallback.
+			if v, ok := decodePrintedString(f[6], false); ok {
+				streamKey = v
+			}
 		}
 
 		m.mu.Lock()
+		// One item is several downloads — a video stream, then an audio
+		// stream, then any subtitles — and yt-dlp restarts its byte counters
+		// at zero for each of them. A new stream is detected by its format id
+		// changing or, when no id is reported, by the byte count going
+		// backwards; either way the stream that just ended is added to the
+		// running total instead of being overwritten by the next one.
+		if (streamKey != "" && streamKey != it.curKey) ||
+			(streamKey == "" && got >= 0 && got < it.curGot) {
+			it.rollStreamLocked()
+			it.curKey = streamKey
+		}
 		if got >= 0 {
-			it.Got = got
+			it.curGot = got
 		}
 		if total >= 0 {
-			it.Total = total
+			it.curTotal = total
 		}
 		if speed >= 0 {
 			it.Speed = speed
@@ -994,14 +1439,45 @@ func (m *Manager) onLine(it *item, line string) {
 		if eta >= 0 {
 			it.ETA = eta
 		}
-		if reportedProgress >= 0 {
-			it.Progress = min(reportedProgress, 100)
-		} else if it.Total > 0 {
+		it.Got = it.doneBytes + it.curGot
+		// Bytes accounted for by the streams this process has seen. It is a
+		// floor, not the answer: streams that have not started yet are not in
+		// it, which is exactly why the announced total is preferred.
+		seen := int64(0)
+		if it.curTotal > 0 {
+			seen = it.doneBytes + it.curTotal
+		}
+		switch {
+		case it.expectTotal > 0:
+			// The announced total covers every stream, so the percentage is
+			// of the whole download from the first byte to the last. It is an
+			// estimate, so it never gets to contradict measurement: if the
+			// streams already add up to more, the measured figure wins.
+			it.Total = max(it.expectTotal, max(seen, it.Got))
+		case seen > 0:
+			it.Total = seen
+		case it.doneBytes > 0:
+			// Streams have finished but the one in flight has not said how
+			// big it is, and nothing announced a total. The item's size is
+			// genuinely unknown: reporting the bytes so far as the total
+			// would show a download that is still running as complete — the
+			// failure this whole change is about.
+			it.Total = 0
+		}
+		switch {
+		case it.Total > 0:
 			p := float64(it.Got) / float64(it.Total) * 100
 			if p > 100 {
 				p = 100
 			}
 			it.Progress = p
+		case reportedProgress >= 0:
+			// yt-dlp's own percentage is per stream, so it is only used while
+			// there is nothing to accumulate and no total to divide by.
+			it.Progress = min(reportedProgress, 100)
+		}
+		if status == "finished" {
+			it.rollStreamLocked()
 		}
 		now := time.Now()
 		var cp ipc.Item
@@ -1017,6 +1493,24 @@ func (m *Manager) onLine(it *item, line string) {
 		if due {
 			m.publish(seq, ipc.Event{Event: "update", Item: &cp})
 		}
+	case strings.HasPrefix(line, "@n|"):
+		total := ParseNum(strings.TrimPrefix(line, "@n|"))
+		if total <= 0 {
+			return
+		}
+		m.mu.Lock()
+		// First announcement only. before_dl fires once per download for the
+		// extractors seen here, but an extractor that fired it per format
+		// would announce that format's size second — shrinking the item's
+		// total mid-download, which is the very thing this field exists to
+		// prevent.
+		if it.expectTotal == 0 {
+			it.expectTotal = total
+			if it.Total < total {
+				it.Total = total
+			}
+		}
+		m.mu.Unlock()
 	case strings.HasPrefix(line, "@t|"):
 		title, ok := decodePrintedString(strings.TrimPrefix(line, "@t|"), true)
 		if !ok {
@@ -1026,7 +1520,7 @@ func (m *Manager) onLine(it *item, line string) {
 		if title == "" {
 			return
 		}
-		title = sanitize(title)
+		title = truncateEncoded(sanitize(title), MaxTitleBytes)
 		m.mu.Lock()
 		if it.Title == title {
 			m.mu.Unlock()
@@ -1055,7 +1549,16 @@ func (m *Manager) onLine(it *item, line string) {
 			return
 		}
 		m.mu.Lock()
-		if !contains(it.Files, path) {
+		// Recorded before the length check: yt-dlp told us it produced this
+		// file, which is what completion cares about. Whether the path fits
+		// the row's storage budget is a separate matter, and only affects
+		// which scratch files cleanup can find later.
+		it.sawOutput = true
+		if encodedLen(path) > MaxFilePathBytes {
+			m.mu.Unlock()
+			return
+		}
+		if !contains(it.Files, path) && len(it.Files) < MaxFilesPerItem {
 			next := make([]string, 0, len(it.Files)+1)
 			next = append(next, it.Files...)
 			next = append(next, path)
@@ -1063,6 +1566,62 @@ func (m *Manager) onLine(it *item, line string) {
 		}
 		m.mu.Unlock()
 	}
+}
+
+// itemExtraArgs parses one item's own extra arguments. The text was validated
+// when the item was added and again whenever state was loaded, so a parse
+// failure here means the value was tampered with on disk: it is dropped rather
+// than passed on, since arguments this function cannot account for are exactly
+// what must never reach a command line.
+func itemExtraArgs(o ipc.Options) []string {
+	args, err := ipc.ExtraArgs(o.ExtraArgs)
+	if err != nil {
+		return nil
+	}
+	return args
+}
+
+// rollStreamLocked closes out the stream currently being reported, folding
+// its bytes into the item's running total. Caller must hold m.mu.
+func (it *item) rollStreamLocked() {
+	it.doneBytes += it.curGot
+	it.curGot = 0
+	it.curTotal = 0
+	it.curKey = ""
+}
+
+// diskSize sums the recorded outputs that actually exist. It is the only
+// authoritative size for a finished item: the streams yt-dlp reports do not
+// add up to the merged file (remuxing drops per-stream container overhead),
+// so the progress counters are replaced by what the filesystem says once
+// there is a file to ask about.
+//
+// Files are deduplicated by identity rather than by name. One download records
+// its output twice — once as the name predicted before downloading, once as
+// the final path after moving — and yt-dlp spells those differently: the
+// prediction is relative to the working directory while the final path is
+// absolute. Both resolve to one file, and summing both reported a 134 MB
+// download as 269 MB.
+func diskSize(files []string) int64 {
+	var sum int64
+	var counted []os.FileInfo
+	for _, p := range files {
+		if !isSafeBase(p) {
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		if slices.ContainsFunc(counted, func(seen os.FileInfo) bool {
+			return os.SameFile(seen, fi)
+		}) {
+			continue
+		}
+		counted = append(counted, fi)
+		sum += fi.Size()
+	}
+	return sum
 }
 
 // PrintLine renders one line of the stdout protocol the runner asks yt-dlp to
@@ -1171,6 +1730,9 @@ func (m *Manager) Resume(id string) error {
 		if it.State != ipc.StatePaused && it.State != ipc.StateFailed && it.State != ipc.StateDeleted {
 			return ErrInvalidState
 		}
+		if it.OptionsInvalid {
+			return ErrOptionsInvalid
+		}
 		// Failed and deleted rows deliberately do NOT reserve their URL — that
 		// is what lets a user re-add one — so between the failure and this
 		// retry another entry may have claimed it. Re-queueing regardless
@@ -1180,7 +1742,7 @@ func (m *Manager) Resume(id string) error {
 		// duplicate pair restored from an older state file must stay resumable
 		// rather than becoming permanently stuck.
 		if it.State == ipc.StateFailed || it.State == ipc.StateDeleted {
-			if dup := m.findDuplicateLocked(it.URL, id); dup != nil {
+			if dup := m.findDuplicateLocked(it.URL, it.Options, id); dup != nil {
 				return dup
 			}
 		}
@@ -1215,6 +1777,9 @@ func (m *Manager) StartNow(id string) error {
 		if it.State != ipc.StateQueued && it.State != ipc.StatePaused && it.State != ipc.StateFailed && it.State != ipc.StateDeleted {
 			return ErrInvalidState
 		}
+		if it.OptionsInvalid {
+			return ErrOptionsInvalid
+		}
 		// Failed and deleted rows deliberately do NOT reserve their URL — that
 		// is what lets a user re-add one — so between the failure and this
 		// retry another entry may have claimed it. Re-queueing regardless
@@ -1224,7 +1789,7 @@ func (m *Manager) StartNow(id string) error {
 		// duplicate pair restored from an older state file must stay resumable
 		// rather than becoming permanently stuck.
 		if it.State == ipc.StateFailed || it.State == ipc.StateDeleted {
-			if dup := m.findDuplicateLocked(it.URL, id); dup != nil {
+			if dup := m.findDuplicateLocked(it.URL, it.Options, id); dup != nil {
 				return dup
 			}
 		}
@@ -1630,6 +2195,26 @@ func (m *Manager) StatsSnapshot() StatsSnapshot {
 		}
 	}
 	return st
+}
+
+// SetExtraArgs replaces the global free-form yt-dlp arguments applied to every
+// download. The text is parsed and validated here, so an invalid value is
+// refused at the point of setting rather than failing every download later.
+// Downloads already running keep the arguments they started with.
+func (m *Manager) SetExtraArgs(raw string) error {
+	args, err := ipc.ExtraArgs(raw)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.extraArgs = args
+	m.mu.Unlock()
+	// Entries produced under the old arguments simply stop matching, since the
+	// cache key contains them; dropping them now just frees the space.
+	m.fmtMu.Lock()
+	clear(m.fmtCache)
+	m.fmtMu.Unlock()
+	return nil
 }
 
 // SetMaxConcurrent updates the concurrency cap at runtime. Reducing the cap

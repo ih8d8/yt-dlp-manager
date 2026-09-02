@@ -53,7 +53,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &req, MaxBodyBytes); err != nil {
 		return
 	}
-	client := remoteClientKey(r)
+	client := s.clientKey(r)
 
 	ok, retryIn := s.deps.Auth.limiter.allow(client)
 	if !ok {
@@ -87,7 +87,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.deps.Auth.limiter.success(client)
 
 	value, csrf := s.deps.Auth.sessions.Create()
-	setSessionCookie(w, s.deps.SecureCookie, value, int((24 * time.Hour).Seconds()))
+	setSessionCookie(w, s.deps.SecureCookie, value, int(sessionTTL.Seconds()))
 	writeJSON(w, http.StatusOK, sessionResponse{Authenticated: true, CSRFToken: csrf})
 }
 
@@ -131,7 +131,7 @@ func (s *Server) handleSessionGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		value, csrf := s.deps.Auth.sessions.Create()
-		setSessionCookie(w, s.deps.SecureCookie, value, int((24 * time.Hour).Seconds()))
+		setSessionCookie(w, s.deps.SecureCookie, value, int(sessionTTL.Seconds()))
 		writeJSON(w, http.StatusOK, sessionResponse{
 			CSRFToken: csrf, SetupRequired: true, SetupTokenRequired: tokenRequired})
 		return
@@ -187,7 +187,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	// session and issue a fresh cookie/CSRF pair to the current browser.
 	s.deps.Auth.sessions.LogoutAll()
 	value, csrf := s.deps.Auth.sessions.Create()
-	setSessionCookie(w, s.deps.SecureCookie, value, int((24 * time.Hour).Seconds()))
+	setSessionCookie(w, s.deps.SecureCookie, value, int(sessionTTL.Seconds()))
 	writeJSON(w, http.StatusOK, sessionResponse{Authenticated: true, CSRFToken: csrf})
 }
 
@@ -197,17 +197,6 @@ func retryInCeil(d time.Duration) string {
 		secs = 1
 	}
 	return strconv.Itoa(secs)
-}
-
-// remoteClientKey keys rate limiting by the socket peer address only.
-// X-Forwarded-For and friends are never trusted without an explicit trusted
-// proxy configuration (a v2 feature).
-func remoteClientKey(r *http.Request) string {
-	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
-	}
-	return host
 }
 
 // setupAuthorized reports whether this request may claim the administrator
@@ -255,6 +244,13 @@ func (s *Server) setupTokenValid(r *http.Request) bool {
 // Note that a proxy (including Docker's userland port proxy) appears as its
 // own address here; forwarded-for headers are deliberately not consulted,
 // since trusting them would restore exactly the spoofable check this replaces.
+//
+// This holds even when TrustedProxies is configured. That setting exists so
+// login rate limiting can tell clients apart (see clientip.go); it is not a
+// statement that a forwarded address proves locality. A proxy that appends to
+// X-Forwarded-For rather than replacing it lets any client that can reach it
+// put "127.0.0.1" in the chain, and first-run setup is precisely the decision
+// that must not be reachable that way. Remote setup uses the token instead.
 func peerIsLoopback(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

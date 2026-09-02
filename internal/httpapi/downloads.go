@@ -12,6 +12,10 @@ import (
 type addDownloadRequest struct {
 	URL      string `json:"url"`
 	StartNow bool   `json:"start_now"`
+	// Options are per-download overrides that beat the yt-dlp configuration
+	// file for this item only. Absent means "use the configured defaults",
+	// which is what the plain paste-and-enter path sends.
+	Options ipc.Options `json:"options"`
 }
 
 type startNowResult struct {
@@ -36,7 +40,14 @@ func (s *Server) handleDownloadAdd(w http.ResponseWriter, r *http.Request) {
 			"url must be http(s), must not exceed 4096 bytes, and may not contain control characters")
 		return
 	}
-	id, err := s.deps.Manager.Add(url)
+	opts := req.Options.Normalize()
+	if verr := opts.Validate(); verr != nil {
+		// 422 rather than 400: the body parsed, the choice inside it is what
+		// cannot be turned into yt-dlp arguments, and the message says which.
+		writeError(w, r, http.StatusUnprocessableEntity, codeInvalidOptions, verr.Error())
+		return
+	}
+	id, err := s.deps.Manager.AddWithOptions(url, opts)
 	if err != nil {
 		// A URL already represented by a queued/running/completed entry is a
 		// conflict, not a bad request: the caller pasted something valid that
@@ -45,6 +56,9 @@ func (s *Server) handleDownloadAdd(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.As(err, &dup):
 			writeError(w, r, http.StatusConflict, codeDuplicateURL, dup.Error())
+		case errors.Is(err, manager.ErrItemTooLarge):
+			// 422: the URL is well formed, it just cannot be stored.
+			writeError(w, r, http.StatusUnprocessableEntity, codeInvalidURL, err.Error())
 		case errors.Is(err, manager.ErrQueueFull):
 			// 507: the request is valid, the server just has nowhere to put it.
 			writeError(w, r, http.StatusInsufficientStorage, codeInvalidState, err.Error())
@@ -119,9 +133,6 @@ type batchResult struct {
 	ID    string    `json:"id"`
 	OK    bool      `json:"ok"`
 	Error *apiError `json:"error,omitempty"`
-	// Note carries a per-id qualification for an action that succeeded but did
-	// not do everything its name implies.
-	Note string `json:"note,omitempty"`
 }
 
 type batchResponse struct {
@@ -162,19 +173,19 @@ func (s *Server) handleBatchActions(w http.ResponseWriter, r *http.Request) {
 
 	seen := make(map[string]bool, len(req.IDs))
 	results := make([]batchResult, 0, len(req.IDs))
-	applyOne := func(id string) (string, error) {
+	applyOne := func(id string) error {
 		mgr := s.deps.Manager
 		switch req.Action {
 		case "pause":
-			return "", mgr.Pause(id)
+			return mgr.Pause(id)
 		case "resume", "retry":
-			return "", mgr.Resume(id)
+			return mgr.Resume(id)
 		case "start_now":
-			return "", mgr.StartNow(id)
+			return mgr.StartNow(id)
 		case "remove":
-			return "", mgr.Cancel(id)
+			return mgr.Cancel(id)
 		}
-		return "", errors.New("unhandled action")
+		return errors.New("unhandled action")
 	}
 
 	for _, id := range req.IDs {
@@ -186,15 +197,14 @@ func (s *Server) handleBatchActions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[id] = true
-		note, err := applyOne(id)
-		if err != nil {
+		if err := applyOne(id); err != nil {
 			results = append(results, batchResult{ID: id, OK: false, Error: &apiError{
 				Code:    actionErrorCode(err),
 				Message: actionErrorMessage(err),
 			}})
 			continue
 		}
-		results = append(results, batchResult{ID: id, OK: true, Note: note})
+		results = append(results, batchResult{ID: id, OK: true})
 	}
 
 	// Per-ID results are the contract; one stale selection must not hide

@@ -125,6 +125,42 @@ export interface BatchOutcome {
 }
 
 /**
+ * One honest sentence for a bulk clear that was sent in chunks.
+ *
+ * Unlike a bulk retry, clearing is finished when the response arrives, so the
+ * wording is past tense — and, exactly as with retry, whatever earlier chunks
+ * already removed is still counted when a later chunk fails. Reporting a bare
+ * failure after hundreds of rows were dropped sends the user looking for
+ * entries that are already gone.
+ */
+export function summarizeBulkClear(
+  total: number,
+  results: BatchOutcome[],
+  sendError: string | null
+): { message: string; ok: boolean } {
+  const cleared = results.filter((r) => r.ok).length
+  const entries = (n: number) => `${n} ${n === 1 ? 'entry' : 'entries'}`
+  if (sendError) {
+    return {
+      message:
+        cleared > 0
+          ? `Cleared ${cleared} of ${total}; the rest failed: ${sendError}`
+          : sendError,
+      ok: false
+    }
+  }
+  const firstFailure = results.find((r) => !r.ok)
+  if (firstFailure) {
+    const reason = firstFailure.error?.message ?? 'action failed'
+    return {
+      message: cleared > 0 ? `Cleared ${cleared} of ${total}; ${reason}` : reason,
+      ok: false
+    }
+  }
+  return { message: `Cleared ${entries(cleared)}`, ok: true }
+}
+
+/**
  * One honest sentence for a bulk action that was sent in chunks.
  *
  * `sendError` is set when a whole request failed (transport, auth, a 5xx) and
