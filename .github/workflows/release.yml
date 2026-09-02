@@ -192,6 +192,10 @@ jobs:
             APP_VERSION=${{ env.RELEASE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Never cache the runtime stage: its `apk upgrade` is what picks up
+          # Alpine security fixes, and a restored layer replays a filesystem
+          # rather than running it. See the same note in ci.yml.
+          no-cache-filters: runtime
 
       - name: Scan runtime image for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -368,6 +372,10 @@ jobs:
             APP_DATE=${{ env.BUILD_DATE }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # The published artifact, so this matters most here: a cached runtime
+          # stage would ship the package set frozen at first build no matter
+          # what the verify job scanned. See the same note in ci.yml.
+          no-cache-filters: runtime
           # Attestations would add extra manifest entries that push-by-digest
           # and `imagetools create` then try to treat as architectures.
           provenance: false

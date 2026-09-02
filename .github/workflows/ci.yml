@@ -228,6 +228,17 @@ jobs:
           tags: yt-dlp-manager:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # The runtime stage must never come from cache. It runs `apk upgrade`
+          # to pick up security fixes published to the stable branch since the
+          # pinned base image was built — and a cached layer does not run
+          # anything, it replays a filesystem. Nothing upstream of that layer
+          # changes when Alpine ships a patch, so the cache stayed valid and the
+          # image kept shipping the package set frozen at first build. That is
+          # not hypothetical: it shipped libexpat 2.8.3-r0 with two HIGH CVEs
+          # while 2.8.4-r0 had been in the repository for some time, and only
+          # the Trivy gate below caught it. The expensive stages (npm ci, the Go
+          # build) stay cached; this one is an apk transaction and a download.
+          no-cache-filters: runtime
 
       # Dependency audits above cover source package managers; this covers the
       # Alpine, ffmpeg, Python and other runtime packages present only in the
