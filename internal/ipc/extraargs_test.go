@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -354,6 +355,35 @@ func TestExtraArgsRefusesOptionsThatChangeTheExitStatus(t *testing.T) {
 	for _, raw := range []string{"--max-downloads 1", "--max-downloads=1"} {
 		if _, err := ExtraArgs(raw); err == nil {
 			t.Errorf("ExtraArgs(%q) was accepted", raw)
+		}
+	}
+}
+
+// ProbeSafeArgs runs on the manager's own goroutines, where a panic takes the
+// whole process down rather than one request. Validation is what normally
+// guarantees every option is followed by its value, so this pins the
+// behaviour if a caller ever forgets: drop the truncated tail, never slice
+// past the end, and never hand yt-dlp an option whose value is missing (it
+// would read the next argument as the value).
+func TestProbeSafeArgsSurvivesATruncatedTail(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"option with no value at all", []string{"--proxy"}, nil},
+		{"valid pair then a truncated option",
+			[]string{"--retries", "3", "--user-agent"}, []string{"--retries", "3"}},
+		{"truncated option that is not probe-safe",
+			[]string{"--limit-rate"}, nil},
+		{"complete input is unchanged",
+			[]string{"--proxy", "http://p:8080", "--force-ipv4"},
+			[]string{"--proxy", "http://p:8080", "--force-ipv4"}},
+	}
+	for _, tc := range cases {
+		got := ProbeSafeArgs(tc.in)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s: ProbeSafeArgs(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
 		}
 	}
 }

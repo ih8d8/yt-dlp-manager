@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -34,7 +36,7 @@ const (
 )
 
 // allowedImageTypes is a set, not a type-to-extension table: cache entries are
-// always named "<id>.img" and the type is re-sniffed on the way out, so an
+// named "<id>/<url tag>.img" and the type is re-sniffed on the way out, so an
 // extension per type would be dead data implying a naming scheme that does not
 // exist. Membership is the whole contract — anything not listed is refused.
 var allowedImageTypes = map[string]struct{}{
@@ -54,27 +56,80 @@ var downloadIDRe = regexp.MustCompile(`^[0-9a-f]{8,64}$`)
 
 func validDownloadID(id string) bool { return downloadIDRe.MatchString(id) }
 
-// thumbCachePath resolves an item's cached thumbnail and verifies the result
-// is still inside the thumbs directory. Both the id check and the containment
-// check are kept: the first is the rule, the second is the backstop.
-func (s *Server) thumbCachePath(id string) (dir, file string, ok bool) {
+// thumbSourceTag fingerprints the URL a cached image came from. It names the
+// cache file, so a re-probe that changes an item's thumbnail URL simply misses
+// the cache instead of being served the previous image forever: the path is a
+// pure function of (id, url) and needs no invalidation step.
+//
+// Truncated to 16 hex characters. This is a cache key, not a security
+// boundary — the URL it names is our own probe output, and a collision would
+// at worst serve one item's own older image.
+func thumbSourceTag(url string) string {
+	sum := sha256.Sum256([]byte(url))
+	return hex.EncodeToString(sum[:8])
+}
+
+// thumbItemDir is where one item's cached images live.
+//
+// A directory per item, rather than "<id>.<tag>.img" flat in one directory, is
+// what keeps eviction proportional to the item. Removal broadcasts one event
+// per row, so clearing a 20,000-row history with a flat layout meant scanning
+// the whole cache 20,000 times — per connected event-stream client. Here the
+// same work is one RemoveAll against a path we can name directly.
+func (s *Server) thumbItemDir(id string) (string, bool) {
 	if s.deps.StateDir == "" || !validDownloadID(id) {
+		return "", false
+	}
+	root := filepath.Join(s.deps.StateDir, "thumbs")
+	dir := filepath.Join(root, id)
+	// validDownloadID already bars separators and dots; this is the backstop.
+	if filepath.Dir(dir) != root {
+		return "", false
+	}
+	return dir, true
+}
+
+// thumbCachePath resolves an item's cached thumbnail and verifies the result
+// is still inside that item's directory. Both the id check and the containment
+// check are kept: the first is the rule, the second is the backstop.
+func (s *Server) thumbCachePath(id, url string) (dir, file string, ok bool) {
+	dir, ok = s.thumbItemDir(id)
+	if !ok || url == "" {
 		return "", "", false
 	}
-	dir = filepath.Join(s.deps.StateDir, "thumbs")
-	file = filepath.Join(dir, id+".img")
+	file = filepath.Join(dir, thumbSourceTag(url)+".img")
 	if filepath.Dir(file) != dir {
 		return "", "", false
 	}
 	return dir, file, true
 }
 
-// EvictThumbnail removes an item's cached thumbnail. It is called from the
+// legacyThumbID recovers the download id from a pre-v2 cache file name.
+//
+// Releases before the per-item layout wrote "<id>.img" directly under thumbs/.
+// Those files can never be served again, so the startup sweep deletes them
+// outright — without this they would sit there for the life of the install,
+// which for a large library is real disk space that nothing ever reclaims.
+func legacyThumbID(name string) (string, bool) {
+	id, ok := strings.CutSuffix(name, ".img")
+	if !ok || !validDownloadID(id) {
+		return "", false
+	}
+	return id, true
+}
+
+// EvictThumbnail removes every cached image for an item. It is called from the
 // removal path, where the id is already known-good, so the cache no longer
 // depends on someone requesting a thumbnail for a dead item to be cleaned up.
+//
+// It drops the item's whole directory, not just the entry matching its current
+// URL: a row that was re-probed may have left an image behind under the
+// previous URL's tag, and the item is going away entirely. Being idempotent
+// and O(1) also matters because every connected event-stream client runs this
+// independently for the same removal.
 func (s *Server) EvictThumbnail(id string) {
-	if _, file, ok := s.thumbCachePath(id); ok {
-		_ = os.Remove(file)
+	if dir, ok := s.thumbItemDir(id); ok {
+		_ = os.RemoveAll(dir)
 	}
 }
 
@@ -91,23 +146,44 @@ func (s *Server) sweepThumbnails() {
 	if err != nil {
 		return
 	}
-	live := make(map[string]struct{})
+	// The file name a live item's cache entry is entitled to have. Anything
+	// else under its directory is an image from a URL it no longer has — a row
+	// that was re-probed after a retry — and is swept with the dead ones.
+	live := make(map[string]string)
 	for _, it := range s.deps.Manager.List() {
-		live[it.ID] = struct{}{}
+		if it.ThumbURL != "" {
+			live[it.ID] = thumbSourceTag(it.ThumbURL) + ".img"
+		}
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if !e.Type().IsRegular() {
+		if !e.IsDir() {
+			// A regular file directly under thumbs/ is either a pre-v2
+			// "<id>.img" entry, which can never be served again and goes, or
+			// something this cache never wrote, which is left alone rather
+			// than deleting a file we cannot account for.
+			if _, ok := legacyThumbID(name); ok {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
 			continue
 		}
-		id, ok := strings.CutSuffix(name, ".img")
-		if !ok || !validDownloadID(id) {
-			// Not something this cache wrote; leave it alone rather than
-			// deleting a file we cannot account for.
+		if !validDownloadID(name) {
 			continue
 		}
-		if _, alive := live[id]; !alive {
-			_ = os.Remove(filepath.Join(dir, name))
+		want, alive := live[name]
+		if !alive {
+			_ = os.RemoveAll(filepath.Join(dir, name))
+			continue
+		}
+		// Live item: keep only the entry its current thumbnail URL names.
+		images, err := os.ReadDir(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		for _, img := range images {
+			if img.Name() != want {
+				_ = os.RemoveAll(filepath.Join(dir, name, img.Name()))
+			}
 		}
 	}
 }
@@ -125,8 +201,8 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, codeNotFound, "no such download")
 		return
 	}
-	dir, cached, pathOK := s.thumbCachePath(id)
-	if it.ThumbURL == "" || !pathOK {
+	dir, cached, pathOK := s.thumbCachePath(id, it.ThumbURL)
+	if !pathOK {
 		writeError(w, r, http.StatusNotFound, codeNotFound, "no thumbnail available")
 		return
 	}
@@ -142,7 +218,9 @@ func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, ctype, err := s.fetchThumbnailOnce(r.Context(), id, it.ThumbURL)
+	// Coalesced per (id, url), matching the cache: a re-probe that changes the
+	// URL mid-flight must not hand the new URL's waiter the old URL's bytes.
+	data, ctype, err := s.fetchThumbnailOnce(r.Context(), id+"."+thumbSourceTag(it.ThumbURL), it.ThumbURL)
 	if err != nil {
 		writeError(w, r, http.StatusBadGateway, codeNotFound, "thumbnail unavailable")
 		return
@@ -360,12 +438,12 @@ type thumbFetch struct {
 // The shared fetch deliberately does not use the first caller's request
 // context: if that client disconnects, everyone waiting behind it would fail
 // too. It gets its own timeout instead.
-func (s *Server) fetchThumbnailOnce(ctx context.Context, id, url string) ([]byte, string, error) {
+func (s *Server) fetchThumbnailOnce(ctx context.Context, key, url string) ([]byte, string, error) {
 	s.thumbFlightMu.Lock()
 	if s.thumbFlight == nil {
 		s.thumbFlight = map[string]*thumbFetch{}
 	}
-	if f, ok := s.thumbFlight[id]; ok {
+	if f, ok := s.thumbFlight[key]; ok {
 		s.thumbFlightMu.Unlock()
 		s.thumbFlightWaiters.Add(1)
 		defer s.thumbFlightWaiters.Add(-1)
@@ -377,7 +455,7 @@ func (s *Server) fetchThumbnailOnce(ctx context.Context, id, url string) ([]byte
 		}
 	}
 	f := &thumbFetch{done: make(chan struct{})}
-	s.thumbFlight[id] = f
+	s.thumbFlight[key] = f
 	s.thumbFlightMu.Unlock()
 
 	go func() {
@@ -386,7 +464,7 @@ func (s *Server) fetchThumbnailOnce(ctx context.Context, id, url string) ([]byte
 		f.data, f.ctype, f.err = fetchThumb(fetchCtx, url)
 		close(f.done)
 		s.thumbFlightMu.Lock()
-		delete(s.thumbFlight, id)
+		delete(s.thumbFlight, key)
 		s.thumbFlightMu.Unlock()
 	}()
 

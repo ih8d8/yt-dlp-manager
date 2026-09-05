@@ -208,6 +208,13 @@ var probeSafeExtraArgs = map[string]bool{
 
 // ProbeSafeArgs filters already-validated arguments down to the ones a probe
 // may use, dropping each rejected option together with the value it consumes.
+//
+// "Already-validated" is the contract, not an assumption it makes: an option
+// left without its value would otherwise slice past the end of the slice, and
+// this runs on the manager's own goroutines where a panic takes the process
+// down rather than one request. A truncated tail is simply dropped — passing a
+// valueless option on to yt-dlp would make it read the next thing on the
+// command line as the value.
 func ProbeSafeArgs(args []string) []string {
 	var out []string
 	for i := 0; i < len(args); i++ {
@@ -215,6 +222,9 @@ func ProbeSafeArgs(args []string) []string {
 		values := 0
 		if !hasInline {
 			values = allowedExtraArgs[name]
+		}
+		if i+values >= len(args) {
+			break
 		}
 		if probeSafeExtraArgs[name] {
 			out = append(out, args[i:i+1+values]...)

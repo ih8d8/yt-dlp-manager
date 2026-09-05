@@ -73,6 +73,14 @@ func (f *fakeRunner) Run(ctx context.Context, job Job, onLine func(string)) (str
 	return "", f.errs[url]
 }
 
+// runCount reports how many times a URL's download has been started, read
+// under the lock so a test can poll it while the runner is working.
+func (f *fakeRunner) runCount(url string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runCnt[url]
+}
+
 func (f *fakeRunner) startedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

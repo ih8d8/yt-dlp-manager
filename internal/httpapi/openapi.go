@@ -186,7 +186,7 @@ func openapiDocument() map[string]any {
 
 	clear := oaMutation(oaOperation(
 		"Clear queue",
-		"Bulk queue action. scope \"finished\" removes completed/failed/deleted history rows. scope \"all\" additionally stops active downloads through the normal cancellation path and removes every queue/history row. Downloaded files are never deleted by either scope — only yt-dlp's own scratch for downloads that were still running.",
+		"Bulk queue action. Scopes \"completed\", \"failed\" and \"deleted\" each remove one terminal state; \"finished\" removes all three. scope \"all\" additionally stops active downloads through the normal cancellation path and removes every queue/history row. Downloaded files are never deleted by any scope — only yt-dlp's own scratch for downloads that were still running. The scope is a server-side state filter, so it clears what is terminal when the request lands, not what the caller last saw.",
 		"Downloads", protected), "Per-session CSRF token returned by GET /api/v1/session.")
 	clear["requestBody"] = oaBody("#/components/schemas/ClearRequest", map[string]any{"scope": "finished"})
 	clear["responses"] = map[string]any{
@@ -524,13 +524,13 @@ func openapiDocument() map[string]any {
 					"type":     "object",
 					"required": []string{"scope"},
 					"properties": map[string]any{
-						"scope": map[string]any{"type": "string", "enum": []string{"finished", "all"}},
+						"scope": map[string]any{"type": "string", "enum": clearScopeList},
 					},
 				},
 				"ClearResponse": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"scope":   map[string]any{"type": "string", "enum": []string{"finished", "all"}},
+						"scope":   map[string]any{"type": "string", "enum": clearScopeList},
 						"removed": map[string]any{"type": "integer"},
 					},
 					"required": []string{"scope", "removed"},

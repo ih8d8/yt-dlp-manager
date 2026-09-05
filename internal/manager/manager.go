@@ -185,6 +185,15 @@ type item struct {
 	// unusually long filename into a false failure.
 	sawOutput bool
 
+	// probeRetry marks a probe that is being re-run because the user retried a
+	// row whose first probe never produced any metadata. Its failure must NOT
+	// fail the row: skipping the probe and downloading anyway is what a retry
+	// did before this existed, and some extractors genuinely cannot answer a
+	// --flat-playlist probe for a URL they can download perfectly well. So a
+	// retry probe that fails falls through to the download instead of taking
+	// away the only way that row could ever run.
+	probeRetry bool
+
 	doneBytes int64
 	curKey    string
 	curGot    int64
@@ -195,6 +204,21 @@ type item struct {
 	// the bar no longer falls backwards when the video ends and the audio
 	// begins. Zero means the extractor did not report one.
 	expectTotal int64
+}
+
+// probeProducedMetadata reports whether a metadata probe ever returned
+// anything for this row.
+//
+// It deliberately does NOT count Files. Files come from downloading, not from
+// probing — and a row carrying files but no title is the exact fingerprint of
+// the bug this guards: before retries re-probed, a row whose probe failed
+// would download anyway and end up with files it never had metadata for.
+// Counting them would leave those rows permanently title-less.
+//
+// `probed` cannot answer this on its own: it is set BEFORE the probe runs and
+// stays set when the probe fails, so it only records that one was attempted.
+func probeProducedMetadata(it ipc.Item) bool {
+	return it.Title != "" || it.ThumbURL != ""
 }
 
 type Manager struct {
@@ -380,7 +404,12 @@ func (m *Manager) restore() {
 		// A bare queued placeholder may not have completed metadata probing
 		// before shutdown. Although it is now represented as paused, preserve
 		// that fact so an explicit resume probes it before trying to download.
-		probed := originalState != ipc.StateQueued || it.Title != "" || len(it.Files) > 0
+		//
+		// Same rule as the retry path, deliberately: two spellings of "has
+		// this been probed" would disagree about a row with a thumbnail but no
+		// title, and about one carrying files it downloaded without ever
+		// having metadata.
+		probed := originalState != ipc.StateQueued || probeProducedMetadata(it)
 		m.items[it.ID] = &item{Item: it, probed: probed}
 	}
 	ordered := make(map[string]struct{}, len(snap.Order))
@@ -950,6 +979,10 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 	it.expanding = false
 	it.cancel = nil
 	m.nexp--
+	// One probe, one meaning: whatever this probe was, the flag must not carry
+	// into whichever probe comes next for this row.
+	wasRetry := it.probeRetry
+	it.probeRetry = false
 
 	removed := it.remove
 	var removedID string
@@ -977,6 +1010,20 @@ func (m *Manager) expand(it *item, ctx context.Context, cancel context.CancelFun
 		// row is restored paused on the next launch and probed again only after
 		// the operator explicitly resumes it; cancellation is not a failure.
 		it.probed = false
+		m.mu.Unlock()
+		m.touch()
+	case wasRetry && (perr != nil || len(entries) == 0):
+		// A retry's probe came back with nothing usable. Before retries
+		// re-probed at all, this row would have gone straight to yt-dlp — and
+		// for an extractor that cannot answer a --flat-playlist probe but
+		// downloads the URL perfectly well, that was the only thing that ever
+		// worked. Failing here would take away the row's only way to run, so
+		// the probe is abandoned rather than fatal: the row stays queued, is
+		// marked probed, and the scheduler runs it as a single download. It
+		// goes without a title and a thumbnail, which is exactly where it
+		// stood before any of this. A real download failure still fails it,
+		// with yt-dlp's own reason rather than the probe's.
+		it.probed = true
 		m.mu.Unlock()
 		m.touch()
 	case perr != nil:
@@ -1723,6 +1770,40 @@ func (m *Manager) Pause(id string) error {
 	return nil
 }
 
+// retryProbeLocked re-arms metadata probing for a row being re-queued that
+// never got any metadata out of a probe.
+//
+// A probe marks the row `probed` before it runs, so a probe that FAILS leaves
+// the row flagged as done. Retrying then went straight to downloading a URL
+// whose title and thumbnail were still unknown, and the row stayed title-less
+// with no image preview for the rest of its life, since nothing ever asked
+// again. It also meant a playlist URL whose probe failed once would be run as
+// a single download instead of being expanded.
+//
+// Rows that already have metadata are left alone: one that probed fine and
+// then failed while downloading must not pay for another probe on every retry.
+//
+// probeRetry is what keeps this from being a one-way door — see the field's
+// comment: if the fresh probe fails too, the row downloads anyway.
+//
+// It must only be called for a row coming back from a TERMINAL state, which is
+// what makes "no metadata" mean "its probe never produced any" rather than
+// "its probe has not finished yet". A queued row may have a probe in flight
+// right now: StartNow accepts queued rows, and the API's start_now path calls
+// it immediately after Add, so a real probe is almost always still running.
+// Re-arming there would clear `probed` under the running probe — costing a
+// second one after it succeeded — and would mark a row's FIRST probe as a
+// retry, so its failure would silently download an unprobed URL instead of
+// failing the row.
+//
+// Callers hold m.mu (via Manager.with).
+func retryProbeLocked(it *item) {
+	if !probeProducedMetadata(it.Item) {
+		it.probed = false
+		it.probeRetry = true
+	}
+}
+
 func (m *Manager) Resume(id string) error {
 	var cp *ipc.Item
 	var seq uint64
@@ -1741,7 +1822,8 @@ func (m *Manager) Resume(id string) error {
 		// bulk. Paused rows still hold their URL and are not re-checked: a
 		// duplicate pair restored from an older state file must stay resumable
 		// rather than becoming permanently stuck.
-		if it.State == ipc.StateFailed || it.State == ipc.StateDeleted {
+		fromTerminal := it.State == ipc.StateFailed || it.State == ipc.StateDeleted
+		if fromTerminal {
 			if dup := m.findDuplicateLocked(it.URL, it.Options, id); dup != nil {
 				return dup
 			}
@@ -1753,6 +1835,13 @@ func (m *Manager) Resume(id string) error {
 		// The row is about to run again: its previous outcome no longer
 		// applies, and a stale DoneAt would render as completed_at.
 		it.StartedAt, it.DoneAt = nil, nil
+		// Only a row that actually reached a terminal state is a retry. A
+		// paused one is not: it may have been paused DURING its first probe,
+		// which already leaves it unprobed on its own, and whose failure
+		// should still fail the row like any first probe.
+		if fromTerminal {
+			retryProbeLocked(it)
+		}
 		if !contains(m.order, id) {
 			m.order = append(m.order, id)
 		}
@@ -1788,7 +1877,8 @@ func (m *Manager) StartNow(id string) error {
 		// bulk. Paused rows still hold their URL and are not re-checked: a
 		// duplicate pair restored from an older state file must stay resumable
 		// rather than becoming permanently stuck.
-		if it.State == ipc.StateFailed || it.State == ipc.StateDeleted {
+		fromTerminal := it.State == ipc.StateFailed || it.State == ipc.StateDeleted
+		if fromTerminal {
 			if dup := m.findDuplicateLocked(it.URL, it.Options, id); dup != nil {
 				return dup
 			}
@@ -1802,6 +1892,12 @@ func (m *Manager) StartNow(id string) error {
 		// report an old error and a completed_at while it was downloading.
 		it.Error = ""
 		it.StartedAt, it.DoneAt = nil, nil
+		// Same gate as Resume, and it matters more here: StartNow also accepts
+		// an already-queued row, and the API calls it right after Add, while
+		// that row's very first probe is still running.
+		if fromTerminal {
+			retryProbeLocked(it)
+		}
 		if !contains(m.order, id) {
 			m.order = append(m.order, id)
 		}
@@ -2002,7 +2098,32 @@ func (m *Manager) countRunningCancellable() int {
 	return n
 }
 
+// finishedStates are the terminal states ClearFinished drops: work that will
+// not run again on its own. Nothing here is active, so clearing them never
+// cancels a download.
+var finishedStates = []ipc.State{ipc.StateCompleted, ipc.StateFailed, ipc.StateDeleted}
+
+// ClearFinished drops every terminal row — completed, failed and
+// files-deleted. Downloaded media is kept; only the list entries go.
 func (m *Manager) ClearFinished() (int, error) {
+	return m.ClearStates(finishedStates...)
+}
+
+// ClearStates drops every row currently in one of the given states and returns
+// how many went. It is the one bulk path for clearing history, so file
+// reference counting, scratch cleanup and "removed" events stay in a single
+// place however the caller narrows the set.
+//
+// Only terminal states are accepted: an active row has a process behind it
+// that has to be cancelled first, which is ClearAll's job, not this one.
+func (m *Manager) ClearStates(states ...ipc.State) (int, error) {
+	want := make(map[ipc.State]struct{}, len(states))
+	for _, st := range states {
+		if !slices.Contains(finishedStates, st) {
+			return 0, fmt.Errorf("%w: %q is not a finished state", ErrInvalidState, st)
+		}
+		want[st] = struct{}{}
+	}
 	m.mu.Lock()
 	if m.closing || m.ctx.Err() != nil {
 		m.mu.Unlock()
@@ -2012,8 +2133,7 @@ func (m *Manager) ClearFinished() (int, error) {
 	var scratch []string
 	refs := m.fileReferenceCountsLocked()
 	for id, it := range m.items {
-		switch it.State {
-		case ipc.StateCompleted, ipc.StateFailed, ipc.StateDeleted:
+		if _, ok := want[it.State]; ok {
 			scratch = append(scratch, releaseFiles(it.Files, refs)...)
 			m.noteRemovedLocked(it.ID)
 			delete(m.items, it.ID)

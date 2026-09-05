@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,13 +21,20 @@ type clearRunner struct {
 	dir string
 }
 
+// thumbFor is the thumbnail clearRunner reports for a URL. Deterministic so a
+// test can name the cache entry the manager will end up with.
+func thumbFor(url string) string { return "https://img.example/" + url + ".jpg" }
+
 func (c clearRunner) Probe(ctx context.Context, job manager.Job) ([]manager.Entry, error) {
 	url := job.URL
-	return []manager.Entry{{URL: url, Title: "Clear Video"}}, nil
+	return []manager.Entry{{URL: url, Title: "Clear Video", Thumbnail: thumbFor(url)}}, nil
 }
 
 func (c clearRunner) Run(ctx context.Context, job manager.Job, onLine func(string)) (string, error) {
 	url := job.URL
+	if strings.Contains(url, "fail") {
+		return "", errors.New("synthetic download failure")
+	}
 	if strings.Contains(url, "hold") {
 		// Stays in "downloading" until cancelled. A runner that finishes
 		// instantly makes Add-then-Pause a race against the scheduler: the
@@ -266,5 +274,87 @@ func TestClearRequiresAuthAndCSRF(t *testing.T) {
 	}
 	if resp.Scope != "finished" || resp.Removed != 0 {
 		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+// The narrowed scopes each drop exactly one terminal state and leave the other
+// terminal rows — and every active row — alone. They exist so the Queue and
+// Library pages can clear one kind of history without sending the server a
+// list of ids that its own view already knows.
+func TestClearNarrowScopesDropOnlyTheirOwnState(t *testing.T) {
+	s, mediaDir := newClearTestServer(t)
+	mgr := s.deps.Manager
+
+	done, _ := mgr.Add("https://example.com/done")
+	bad, _ := mgr.Add("https://example.com/fail")
+	waitFor(t, 5*time.Second, func() bool {
+		a, _ := mgr.Get(done)
+		b, _ := mgr.Get(bad)
+		return a.State == ipc.StateCompleted && len(a.Files) > 0 && b.State == ipc.StateFailed
+	}, "one completed and one failed row")
+
+	// Clearing failures must leave the completed row and its file untouched.
+	code, resp := clearCall(t, s, map[string]any{"scope": "failed"})
+	if code != http.StatusOK || resp.Scope != "failed" || resp.Removed != 1 {
+		t.Fatalf("clear failed: code=%d resp=%+v, want 200 scope=failed removed=1", code, resp)
+	}
+	if _, ok := mgr.Get(bad); ok {
+		t.Error("failed row survived scope=failed")
+	}
+	if _, ok := mgr.Get(done); !ok {
+		t.Fatal("completed row must survive scope=failed")
+	}
+
+	// And clearing completions takes the remaining row while keeping the file.
+	code, resp = clearCall(t, s, map[string]any{"scope": "completed"})
+	if code != http.StatusOK || resp.Scope != "completed" || resp.Removed != 1 {
+		t.Fatalf("clear completed: code=%d resp=%+v, want 200 scope=completed removed=1", code, resp)
+	}
+	if len(mgr.List()) != 0 {
+		t.Errorf("rows survived both narrow clears: %+v", mgr.List())
+	}
+	if _, err := os.Stat(filepath.Join(mediaDir, "done.bin")); err != nil {
+		t.Errorf("completed output file must be kept: %v", err)
+	}
+}
+
+// A narrowed scope must never touch work that is still running: only ClearAll
+// cancels, and it says so.
+func TestClearNarrowScopesLeaveActiveWorkAlone(t *testing.T) {
+	s, _ := newClearTestServer(t)
+	mgr := s.deps.Manager
+
+	active, _ := mgr.Add("https://example.com/hold")
+	waitFor(t, 5*time.Second, func() bool {
+		it, _ := mgr.Get(active)
+		return it.State == ipc.StateDownloading
+	}, "download to start")
+
+	for _, scope := range []string{"completed", "failed", "deleted", "finished"} {
+		code, resp := clearCall(t, s, map[string]any{"scope": scope})
+		if code != http.StatusOK || resp.Removed != 0 {
+			t.Errorf("scope %q: code=%d removed=%d, want 200 and 0", scope, code, resp.Removed)
+		}
+	}
+	it, ok := mgr.Get(active)
+	if !ok || it.State != ipc.StateDownloading {
+		t.Fatalf("active row = %+v (present=%v), want still downloading", it, ok)
+	}
+}
+
+// The advertised enum and the enum the handler actually accepts are the same
+// list. A scope the OpenAPI document promises but the handler rejects (or the
+// reverse) is a contract the generated client cannot rely on.
+func TestClearScopeEnumMatchesTheHandler(t *testing.T) {
+	s, _ := newClearTestServer(t)
+	for _, scope := range clearScopeList {
+		if code, _ := clearCall(t, s, map[string]any{"scope": scope}); code != http.StatusOK {
+			t.Errorf("advertised scope %q was rejected with %d", scope, code)
+		}
+	}
+	for _, scope := range []string{"queued", "downloading", "paused", "history", "everything", "ALL"} {
+		if code, _ := clearCall(t, s, map[string]any{"scope": scope}); code != http.StatusUnprocessableEntity {
+			t.Errorf("scope %q = %d, want 422", scope, code)
+		}
 	}
 }

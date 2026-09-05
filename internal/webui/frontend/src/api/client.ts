@@ -55,7 +55,12 @@ export function getCsrfToken(): string | null {
   return csrfToken
 }
 
-export type ClearScope = 'finished' | 'all'
+/**
+ * Mirrors clearScopeStates in internal/httpapi/clear.go. Every scope but
+ * 'all' is a terminal-state filter and never touches active work; 'all' also
+ * cancels what is running. No scope ever deletes downloaded media.
+ */
+export type ClearScope = 'completed' | 'failed' | 'deleted' | 'finished' | 'all'
 
 export interface ClearResponse {
   scope: ClearScope

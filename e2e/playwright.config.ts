@@ -21,9 +21,12 @@ const port = Number(process.env.YTM_E2E_PORT ?? 18422)
 const runtimeDir = mkdtempSync(join(tmpdir(), 'ytm-e2e-'))
 process.env.YTM_E2E_RUNTIME_DIR = runtimeDir
 
-// Seed the real persistence file with both kinds of unfinished work. The
-// server must expose both as recovery-paused after boot; if either one is left
-// queued, its scheduler will start it and the browser regression test fails.
+// Seed the real persistence file with both kinds of unfinished work, plus one
+// row in each terminal state. The server must expose the unfinished pair as
+// recovery-paused after boot; if either one is left queued, its scheduler will
+// start it and the browser regression test fails. The terminal rows are what
+// the per-state "Clear …" buttons act on, and they are seeded rather than
+// downloaded so the suite never needs the network.
 const addedAt = '2026-01-02T03:04:05Z'
 writeFileSync(join(runtimeDir, 'state.json'), JSON.stringify({
   version: 1,
@@ -41,11 +44,34 @@ writeFileSync(join(runtimeDir, 'state.json'), JSON.stringify({
       id: 'e2e-active',
       url: 'https://example.com/recovered-active',
       title: 'Recovered active item',
+      // A probed thumbnail, so the browser actually requests the proxy. The
+      // fetch itself cannot succeed here (the SSRF dialer refuses anything
+      // that is not public unicast), which is fine: what this seed exists to
+      // exercise is the URL the page asks for.
+      thumb_url: 'https://img.example/recovered-active.jpg',
       state: 'downloading',
       progress: 42,
       got: 420,
       total: 1000,
       added_at: addedAt
+    },
+    {
+      id: 'e2e-completed',
+      url: 'https://example.com/finished-item',
+      title: 'Finished item',
+      state: 'completed',
+      progress: 100,
+      added_at: addedAt,
+      done_at: addedAt
+    },
+    {
+      id: 'e2e-failed',
+      url: 'https://example.com/broken-item',
+      title: 'Broken item',
+      state: 'failed',
+      error: 'HTTP Error 404: Not Found',
+      added_at: addedAt,
+      done_at: addedAt
     }
   ],
   order: ['e2e-queued']

@@ -90,7 +90,7 @@ yt-dlp-manager pause ID        pause, keeping partial files
 yt-dlp-manager resume ID       re-queue a paused download
 yt-dlp-manager start-now ID    prioritize now (at most 8 above the concurrency limit)
 yt-dlp-manager remove ID       drop a row (keeps your downloaded file)
-yt-dlp-manager clear-finished  drop completed and failed rows
+yt-dlp-manager clear-finished  drop completed, failed and files-deleted rows
 yt-dlp-manager --help          every command and flag
 ```
 

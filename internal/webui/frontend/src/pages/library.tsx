@@ -2,12 +2,13 @@ import { h } from 'preact'
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import type { AppState } from '../state/downloads'
 import { rangeBetween } from '../state/downloads'
-import type { Download } from '../api/types'
+import type { BatchResult, Download } from '../api/types'
 import { api } from '../api/client'
+import type { ClearScope } from '../api/client'
 import { Dialog } from '../components/dialog'
 import { DownloadRow } from '../components/download-row'
 import { DetailsDrawer } from './queue'
-import { summarizeBulkClear } from '../format'
+import { clearedMessage, countPhrase } from '../format'
 
 interface PageProps {
   state: AppState
@@ -17,18 +18,20 @@ interface PageProps {
 type LibFilter = 'all' | 'completed' | 'failed' | 'deleted'
 type SortKey = 'newest' | 'oldest' | 'title' | 'size'
 
-// Mirrors maxBatchIDs in internal/httpapi/downloads.go.
-const MAX_BATCH_IDS = 500
+/**
+ * What one "Clear …" button clears, and the server scope behind it. Every
+ * target is a terminal-state filter the server applies itself; the page sends
+ * a scope, never a list of ids, so a row that reached that state between the
+ * render and the click is cleared too instead of being left behind.
+ */
+const CLEAR_TARGETS = {
+  completed: { scope: 'completed', label: 'completed' },
+  failed: { scope: 'failed', label: 'failed' },
+  deleted: { scope: 'deleted', label: 'files-deleted' },
+  history: { scope: 'finished', label: 'all history' }
+} as const satisfies Record<string, { scope: ClearScope; label: string }>
 
-/** What one "Clear …" button clears. 'history' is every finished state. */
-type ClearTarget = 'completed' | 'failed' | 'deleted' | 'history'
-
-const CLEAR_LABELS: Record<ClearTarget, string> = {
-  completed: 'completed',
-  failed: 'failed',
-  deleted: 'files-deleted',
-  history: 'all history'
-}
+type ClearTarget = keyof typeof CLEAR_TARGETS
 
 /**
  * Library is a filtered view over completed/failed/deleted manager items.
@@ -125,16 +128,9 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
     })
   }
 
-  const reportResults = (
-    results: { id: string; ok: boolean; error?: { message?: string }; note?: string }[]
-  ) => {
-    const failures = results.filter((result) => !result.ok)
-    if (failures.length > 0) {
-      pushToast(failures[0].error?.message ?? 'action failed')
-      return
-    }
-    const note = results.find((r) => r.note)?.note
-    if (note) pushToast(note)
+  const reportResults = (results: BatchResult[]) => {
+    const failure = results.find((result) => !result.ok)
+    if (failure) pushToast(failure.error?.message ?? 'action failed')
   }
 
   const runBatch = async (action: 'retry' | 'remove', ids: string[]) => {
@@ -187,52 +183,29 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
 
   // Counts come from every tracked item, not the filtered page: a button that
   // says "Clear failed (12)" must mean the same thing whatever the view is
-  // currently filtered or searched down to.
+  // currently filtered or searched down to. They label and enable the buttons
+  // only — the server decides what a scope actually matches.
   const all = [...state.downloads.values()]
-  const idsFor = (target: ClearTarget): string[] =>
-    all
-      .filter((d) =>
-        target === 'history'
-          ? d.state === 'completed' || d.state === 'failed' || d.state === 'deleted'
-          : d.state === target
-      )
-      .map((d) => d.id)
-
+  const countOf = (want: Download['state']) => all.filter((d) => d.state === want).length
+  const terminal = {
+    completed: countOf('completed'),
+    failed: countOf('failed'),
+    deleted: countOf('deleted')
+  }
   const clearCounts: Record<ClearTarget, number> = {
-    completed: idsFor('completed').length,
-    failed: idsFor('failed').length,
-    deleted: idsFor('deleted').length,
-    history: idsFor('history').length
+    ...terminal,
+    history: terminal.completed + terminal.failed + terminal.deleted
   }
 
+  // One server-side call per clear rather than thousands of ids over the
+  // wire: at the supported 20,000-row history, sending the ids meant forty
+  // round trips that could half-succeed, and each of them could only name the
+  // rows this page had already rendered.
   const runClear = async (target: ClearTarget) => {
     setClearBusy(target)
     try {
-      if (target === 'history') {
-        // One server-side call rather than thousands of ids over the wire:
-        // the clear endpoint's "finished" scope is exactly the three states
-        // this page shows.
-        const resp = await api.clearQueue('finished')
-        pushToast(
-          resp.removed > 0 ? `Cleared ${resp.removed} entries` : 'Nothing to clear',
-          true
-        )
-      } else {
-        const ids = idsFor(target)
-        const results: { id: string; ok: boolean; error?: { message?: string } }[] = []
-        let sendError: string | null = null
-        for (let i = 0; i < ids.length; i += MAX_BATCH_IDS) {
-          try {
-            const resp = await api.batchAction('remove', ids.slice(i, i + MAX_BATCH_IDS))
-            results.push(...resp.results)
-          } catch (e) {
-            sendError = e instanceof Error ? e.message : 'clear failed'
-            break
-          }
-        }
-        const verdict = summarizeBulkClear(ids.length, results, sendError)
-        pushToast(verdict.message, verdict.ok)
-      }
+      const resp = await api.clearQueue(CLEAR_TARGETS[target].scope)
+      pushToast(resp.removed > 0 ? clearedMessage(resp.removed) : 'Nothing to clear', true)
       setSelection(new Set())
       setPage(0)
     } catch (e) {
@@ -308,12 +281,12 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
               title={
                 target === 'history'
                   ? 'Remove every completed, failed and files-deleted entry from the list'
-                  : `Remove every ${CLEAR_LABELS[target]} entry from the list`
+                  : `Remove every ${CLEAR_TARGETS[target].label} entry from the list`
               }
             >
               {clearBusy === target
                 ? 'Clearing…'
-                : `Clear ${CLEAR_LABELS[target]}${clearCounts[target] > 0 ? ` (${clearCounts[target]})` : ''}`}
+                : `Clear ${CLEAR_TARGETS[target].label}${clearCounts[target] > 0 ? ` (${clearCounts[target]})` : ''}`}
             </button>
           ))}
         </div>
@@ -419,16 +392,27 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
 
       {confirmClear && (
         <Dialog
-          title={`Clear ${CLEAR_LABELS[confirmClear]}?`}
+          title={`Clear ${CLEAR_TARGETS[confirmClear].label}?`}
           onClose={() => clearBusy === null && setConfirmClear(null)}
         >
+          {/* The request names a state, not a list of ids, so the server
+              clears what matches when it arrives. Saying "this removes N"
+              would be a promise the request cannot keep: a download that
+              finishes while this dialog is open goes too. The count is
+              offered as what is there now, and the sentence after it says
+              plainly that late arrivals are included. */}
           <p>
-            This removes {clearCounts[confirmClear]}{' '}
-            {confirmClear === 'history'
-              ? 'history entries'
-              : `${CLEAR_LABELS[confirmClear]} entries`}{' '}
-            from the manager's list. Downloaded files stay on disk — only the
+            {countPhrase(
+              clearCounts[confirmClear],
+              confirmClear === 'history' ? 'history' : CLEAR_TARGETS[confirmClear].label
+            )}{' '}
+            in the list right now. Downloaded files stay on disk — only the
             list entries go.
+          </p>
+          <p class="hint">
+            {confirmClear === 'history'
+              ? 'Anything that finishes or fails before you confirm is cleared too.'
+              : `Anything that becomes ${CLEAR_TARGETS[confirmClear].label} before you confirm is cleared too.`}
           </p>
           <div class="dialog-actions">
             <button
@@ -447,7 +431,7 @@ export function LibraryPage({ state, pushToast }: PageProps): h.JSX.Element {
                 void runClear(target)
               }}
             >
-              Clear {CLEAR_LABELS[confirmClear]}
+              Clear {CLEAR_TARGETS[confirmClear].label}
             </button>
           </div>
         </Dialog>

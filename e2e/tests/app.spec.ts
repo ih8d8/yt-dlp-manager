@@ -162,3 +162,112 @@ test('logout, a wrong password, then a real sign-in', async ({ page }) => {
     await expect(page.getByRole('heading', { name: 'Queue', level: 1 })).toBeVisible({ timeout: 2000 })
   }).toPass({ timeout: 30000 })
 })
+
+// A failed row is a two-column layout (everything it knows, then its actions)
+// living in a list whose other rows have eight. Several breakpoints re-state
+// .row-main's column list, and matching specificity meant the later rule won:
+// at this very viewport the title and the error reason were squeezed into a
+// 20px column, one character per line. Measured, not screenshotted, so the
+// check says what actually went wrong.
+test('a failed row gives its title and reason the full row width', async ({ page }) => {
+  await signIn(page)
+
+  const failed = page.locator('.row-failed')
+  await expect(failed).toHaveCount(1)
+  await expect(failed.getByText('Broken item')).toBeVisible()
+
+  // Both widths that the specificity clash broke: the 1151-1320px desktop
+  // band and the narrow-phone band under 430px.
+  for (const width of [1280, 400]) {
+    await page.setViewportSize({ width, height: 900 })
+    const row = (await failed.boundingBox())!
+    const meta = (await failed.locator('.row-meta').boundingBox())!
+    expect(meta.width, `at ${width}px the failed row's text column collapsed`)
+      .toBeGreaterThan(row.width * 0.6)
+
+    // The reason reads as a line of prose, not a column of single characters.
+    const reason = (await failed.locator('.text-danger').boundingBox())!
+    expect(reason.width, `at ${width}px the failure reason wrapped per character`)
+      .toBeGreaterThan(reason.height)
+    // And the title is not ellipsised down to a letter or two.
+    await expect(failed.locator('.row-title')).toHaveText('Broken item')
+  }
+})
+
+// The per-state clear buttons. They must sit to the LEFT of the broader
+// "Clear finished", narrow to a single state, and — like every clear — leave
+// unfinished work alone. Kept last in the file: it consumes the seeded
+// terminal rows, and the specs share one server.
+test('clear completed and clear failed narrow the queue clear', async ({ page }) => {
+  await signIn(page)
+
+  const toolbar = page.getByRole('toolbar', { name: 'Queue-wide actions' })
+  const labels = await toolbar.getByRole('button').allInnerTexts()
+  expect(labels.map((l) => l.replace(/\s*\(\d+\)$/, ''))).toEqual([
+    'Resume all paused',
+    'Clear completed',
+    'Clear failed',
+    'Clear finished',
+    'Clear all'
+  ])
+
+  // The scope goes to the server as a name, never as a list of ids: that is
+  // what keeps a row which finished mid-click from being left behind.
+  const scopes: string[] = []
+  page.on('request', (req) => {
+    if (req.url().endsWith('/api/v1/downloads/clear') && req.method() === 'POST') {
+      scopes.push((req.postDataJSON() as { scope: string }).scope)
+    }
+  })
+
+  await expect(toolbar.getByRole('button', { name: 'Clear failed (1)' })).toBeEnabled()
+  await toolbar.getByRole('button', { name: 'Clear failed (1)' }).click()
+  await expect(page.getByText('Cleared 1 failed entry')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Failed downloads' })).toHaveCount(0)
+
+  // The completed row is untouched by clearing failures, and still counted.
+  const clearCompleted = toolbar.getByRole('button', { name: 'Clear completed (1)' })
+  await expect(clearCompleted).toBeEnabled()
+  await clearCompleted.click()
+  await expect(page.getByText('Cleared 1 completed entry')).toBeVisible()
+
+  expect(scopes).toEqual(['failed', 'completed'])
+
+  // Both narrow buttons are now empty and disabled, and the recovery-paused
+  // rows this suite depends on survived every clear.
+  await expect(toolbar.getByRole('button', { name: 'Clear completed' })).toBeDisabled()
+  await expect(toolbar.getByRole('button', { name: 'Clear failed' })).toBeDisabled()
+  await expect(page.locator('.queue-list > li').filter({ has: page.locator('.st-paused') })).toHaveCount(2)
+})
+
+// The proxy path is keyed by item id alone, so without a version in the query
+// a re-probed thumbnail would keep the byte-identical src: Preact would leave
+// the attribute untouched, and a request that did go out would be answered
+// from the browser's own cache for the 24 hours the response advertises. This
+// asserts the request the browser actually makes, which is the half a unit
+// test cannot see.
+test('the thumbnail request carries a version derived from the probed url', async ({ page }) => {
+  const asked: string[] = []
+  await page.route('**/api/v1/downloads/*/thumbnail*', async (route) => {
+    asked.push(route.request().url())
+    await route.fulfill({ status: 502, body: '' })
+  })
+  await signIn(page)
+
+  await expect(async () => {
+    expect(asked.length).toBeGreaterThan(0)
+  }).toPass({ timeout: 5000 })
+
+  const versions = asked.map((u) => new URL(u).searchParams.get('v'))
+  expect(versions.every((v) => v && /^[0-9a-z]+$/.test(v))).toBe(true)
+
+  // A failed fetch falls back to the inline placeholder rather than a broken
+  // image, and does not retry on every render.
+  const before = asked.length
+  await page.getByRole('button', { name: 'Recovered queued item', exact: true }).click()
+  await page.getByRole('button', { name: 'Close details' }).click()
+  expect(asked.length).toBe(before)
+  const src = await page.locator('.row-main').filter({ hasText: 'Recovered active item' })
+    .locator('.thumb img').getAttribute('src')
+  expect(src).toMatch(/^data:image\/svg\+xml/)
+})

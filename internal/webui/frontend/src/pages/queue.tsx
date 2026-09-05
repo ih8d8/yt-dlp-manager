@@ -4,12 +4,12 @@ import type { AppState } from '../state/downloads'
 import { queueOrder, rangeBetween, reduce } from '../state/downloads'
 import { api } from '../api/client'
 import type { ClearScope } from '../api/client'
-import type { Download, DownloadOptions } from '../api/types'
+import type { BatchResult, Download, DownloadOptions } from '../api/types'
 import { Dialog } from '../components/dialog'
 import { AddOptionsDialog } from '../components/add-options-dialog'
 import { DownloadRow, StatePill } from '../components/download-row'
 import { Thumb } from '../components/thumb'
-import { formatBytes, formatEta, formatPercent, formatSpeed, displayTitle, hasKnownTotal, summarizeBulkRetry } from '../format'
+import { formatBytes, formatEta, formatPercent, formatSpeed, clearedMessage, displayTitle, hasKnownTotal, summarizeBulkRetry } from '../format'
 
 interface PageProps {
   state: AppState
@@ -21,6 +21,30 @@ interface PageProps {
 const URL_MAX = 4096
 // Mirrors maxBatchIDs in internal/httpapi/downloads.go.
 const MAX_BATCH_IDS = 500
+
+/**
+ * The clear scopes offered as their own button, narrowest first, so the
+ * broader "Clear finished" sits to their right and "Clear all" — which also
+ * stops running work — stays last. None of them deletes a downloaded file.
+ */
+const NARROW_CLEAR_SCOPES = ['completed', 'failed', 'finished'] as const
+type NarrowClearScope = (typeof NARROW_CLEAR_SCOPES)[number]
+
+const CLEAR_HINTS: Record<NarrowClearScope, string> = {
+  completed: 'Remove completed entries from the list (files are kept)',
+  failed: 'Remove failed entries from the list',
+  finished: 'Remove completed, failed and deleted entries from the list (files are kept)'
+}
+
+// How the toast names what went. "all" spans queued and running rows too, so
+// it gets a bare count rather than a state name it would only half fit.
+const CLEAR_KINDS: Record<ClearScope, string> = {
+  completed: 'completed',
+  failed: 'failed',
+  deleted: 'files-deleted',
+  finished: 'finished',
+  all: ''
+}
 
 export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Element {
   const [url, setUrl] = useState('')
@@ -130,11 +154,15 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     pushToast(startNow ? 'Added and starting now' : 'Added to queue', true)
   }
 
-  // Queue-wide actions. The server owns the semantics (manager.ClearFinished
-  // / ClearAll); SSE reconciles the rows — nothing is claimed locally.
-  const finishedCount = downloads.filter((d) =>
-    ['completed', 'failed', 'deleted'].includes(d.state)
-  ).length
+  // Queue-wide actions. The server owns the semantics (manager.ClearStates /
+  // ClearAll); SSE reconciles the rows — nothing is claimed locally. The
+  // counts here are only for the labels: the request names a scope, never a
+  // list of ids, so what actually goes is whatever is terminal when it lands.
+  const clearCounts: Record<NarrowClearScope, number> = {
+    completed,
+    failed: failedRows.length,
+    finished: downloads.filter((d) => ['completed', 'failed', 'deleted'].includes(d.state)).length
+  }
   const totalCount = downloads.length
 
   const clearQueue = async (scope: ClearScope) => {
@@ -142,9 +170,7 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     try {
       const resp = await api.clearQueue(scope)
       pushToast(
-        resp.removed > 0
-          ? `Cleared ${resp.removed} ${scope === 'finished' ? 'finished entries' : 'entries'}`
-          : 'Nothing to clear',
+        resp.removed > 0 ? clearedMessage(resp.removed, CLEAR_KINDS[scope]) : 'Nothing to clear',
         true
       )
     } catch (e) {
@@ -205,23 +231,18 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     }
   }
 
-  const reportBatch = (
-    results: { id: string; ok: boolean; error?: { message?: string }; note?: string }[]
-  ) => {
+  // Typed as the API's own BatchResult rather than an inline shape, so a
+  // field the server stops sending — or never sent — is a compile error here
+  // instead of a branch that silently never runs.
+  const reportBatch = (results: BatchResult[]) => {
     const failures = results.filter((r) => !r.ok)
-    if (failures.length > 0) {
-      const firstMsg = failures[0].error?.message ?? 'action failed'
-      pushToast(
-        failures.length === results.length
-          ? firstMsg
-          : `${results.length - failures.length}/${results.length} succeeded; ${firstMsg}`
-      )
-      return
-    }
-    // A succeeded-but-qualified result (e.g. files another entry also records
-    // were kept) must not read as a plain success.
-    const note = results.find((r) => r.note)?.note
-    if (note) pushToast(note)
+    if (failures.length === 0) return
+    const firstMsg = failures[0].error?.message ?? 'action failed'
+    pushToast(
+      failures.length === results.length
+        ? firstMsg
+        : `${results.length - failures.length}/${results.length} succeeded; ${firstMsg}`
+    )
   }
 
   // Bulk retry of the whole failed section. The API caps one batch at 500 ids,
@@ -234,7 +255,7 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     if (!connected || retryableFailed.length === 0) return
     setRetryAllBusy(true)
     const total = retryableFailed.length
-    const results: { id: string; ok: boolean; error?: { message?: string }; note?: string }[] = []
+    const results: BatchResult[] = []
     let sendError: string | null = null
     try {
       for (let i = 0; i < total; i += MAX_BATCH_IDS) {
@@ -257,7 +278,7 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
     if (!connected || pausedTargets.length === 0) return
     setResumeAllBusy(true)
     const ids = [...pausedTargets]
-    const results: { id: string; ok: boolean; error?: { message?: string }; note?: string }[] = []
+    const results: BatchResult[] = []
     let sendError: string | null = null
     try {
       for (let i = 0; i < ids.length; i += MAX_BATCH_IDS) {
@@ -429,11 +450,19 @@ export function QueuePage({ state, setState, pushToast }: PageProps): h.JSX.Elem
             title="Resume every paused download while respecting the concurrency limit">
             {resumeAllBusy ? 'Resuming…' : `Resume all paused${pausedTargets.length > 0 ? ` (${pausedTargets.length})` : ''}`}
           </button>
-          <button class="btn small" disabled={!connected || clearBusy !== null || finishedCount === 0}
-            onClick={() => void clearQueue('finished')}
-            title="Remove completed, failed and deleted entries from the list (files are kept)">
-            {clearBusy === 'finished' ? 'Clearing…' : `Clear finished${finishedCount > 0 ? ` (${finishedCount})` : ''}`}
-          </button>
+          {NARROW_CLEAR_SCOPES.map((scope) => (
+            <button
+              key={scope}
+              class="btn small"
+              disabled={!connected || clearBusy !== null || clearCounts[scope] === 0}
+              onClick={() => void clearQueue(scope)}
+              title={CLEAR_HINTS[scope]}
+            >
+              {clearBusy === scope
+                ? 'Clearing…'
+                : `Clear ${scope}${clearCounts[scope] > 0 ? ` (${clearCounts[scope]})` : ''}`}
+            </button>
+          ))}
           <button class="btn small" disabled={!connected || clearBusy !== null || totalCount === 0}
             onClick={() => setConfirmClearAll(true)}
             title="Stop active downloads and remove every entry; downloaded files are kept">

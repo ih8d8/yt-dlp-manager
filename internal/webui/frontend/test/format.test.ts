@@ -9,8 +9,9 @@ import {
   hasKnownTotal,
   progressLabelText,
   progressTrackMode,
-  summarizeBulkClear,
-  summarizeBulkRetry
+  summarizeBulkRetry,
+  clearedMessage,
+  countPhrase
 } from '../src/format'
 import { initialState, queueOrder, reduce } from '../src/state/downloads'
 import type { Download } from '../src/api/types'
@@ -262,35 +263,30 @@ describe('summarizeBulkRetry', () => {
   })
 })
 
-describe('summarizeBulkClear', () => {
-  it('reports what was cleared', () => {
-    const r = summarizeBulkClear(3, [{ ok: true }, { ok: true }, { ok: true }], null)
-    expect(r).toEqual({ message: 'Cleared 3 entries', ok: true })
+describe('clearedMessage', () => {
+  it('names the states that went', () => {
+    expect(clearedMessage(3, 'failed')).toBe('Cleared 3 failed entries')
   })
 
   it('uses the singular for one entry', () => {
-    expect(summarizeBulkClear(1, [{ ok: true }], null).message).toBe('Cleared 1 entry')
+    expect(clearedMessage(1, 'completed')).toBe('Cleared 1 completed entry')
   })
 
-  // A later chunk failing must not hide the rows earlier chunks already
-  // removed, or the user goes looking for entries that are already gone.
-  it('still counts what earlier chunks removed when a later one fails', () => {
-    const r = summarizeBulkClear(900, [{ ok: true }, { ok: true }], 'network error')
-    expect(r.ok).toBe(false)
-    expect(r.message).toBe('Cleared 2 of 900; the rest failed: network error')
+  // A scope spanning several states gets a bare count rather than a state
+  // name it would only half fit.
+  it('omits the kind when there is not one', () => {
+    expect(clearedMessage(12)).toBe('Cleared 12 entries')
+    expect(clearedMessage(1)).toBe('Cleared 1 entry')
+  })
+})
+
+describe('countPhrase', () => {
+  it('agrees noun and verb in the singular', () => {
+    expect(countPhrase(1, 'completed')).toBe('1 completed entry is')
   })
 
-  it('surfaces a per-id failure reason', () => {
-    const r = summarizeBulkClear(
-      2,
-      [{ ok: true }, { ok: false, error: { message: 'no such download' } }],
-      null
-    )
-    expect(r.ok).toBe(false)
-    expect(r.message).toBe('Cleared 1 of 2; no such download')
-  })
-
-  it('reports the bare error when nothing was cleared', () => {
-    expect(summarizeBulkClear(5, [], 'offline').message).toBe('offline')
+  it('agrees noun and verb in the plural', () => {
+    expect(countPhrase(12, 'failed')).toBe('12 failed entries are')
+    expect(countPhrase(0, 'history')).toBe('0 history entries are')
   })
 })

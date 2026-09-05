@@ -21,7 +21,7 @@ const usage = `usage: yt-dlp-manager <command> [args]
   resume <id>               re-queue paused download
   start-now <id>            force start ahead of the queue (up to 8 over the limit)
   cancel|remove <id>        remove from list (stops if running, clears partials)
-  clear-finished            drop completed/failed rows
+  clear-finished            drop completed, failed and files-deleted rows
   clear-all                 stop everything and empty the list
 
 ids are shown by 'yt-dlp-manager list'; commands need a running manager —
