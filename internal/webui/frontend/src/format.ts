@@ -125,42 +125,6 @@ export interface BatchOutcome {
 }
 
 /**
- * One honest sentence for a bulk clear that was sent in chunks.
- *
- * Unlike a bulk retry, clearing is finished when the response arrives, so the
- * wording is past tense — and, exactly as with retry, whatever earlier chunks
- * already removed is still counted when a later chunk fails. Reporting a bare
- * failure after hundreds of rows were dropped sends the user looking for
- * entries that are already gone.
- */
-export function summarizeBulkClear(
-  total: number,
-  results: BatchOutcome[],
-  sendError: string | null
-): { message: string; ok: boolean } {
-  const cleared = results.filter((r) => r.ok).length
-  const entries = (n: number) => `${n} ${n === 1 ? 'entry' : 'entries'}`
-  if (sendError) {
-    return {
-      message:
-        cleared > 0
-          ? `Cleared ${cleared} of ${total}; the rest failed: ${sendError}`
-          : sendError,
-      ok: false
-    }
-  }
-  const firstFailure = results.find((r) => !r.ok)
-  if (firstFailure) {
-    const reason = firstFailure.error?.message ?? 'action failed'
-    return {
-      message: cleared > 0 ? `Cleared ${cleared} of ${total}; ${reason}` : reason,
-      ok: false
-    }
-  }
-  return { message: `Cleared ${entries(cleared)}`, ok: true }
-}
-
-/**
  * One honest sentence for a bulk action that was sent in chunks.
  *
  * `sendError` is set when a whole request failed (transport, auth, a 5xx) and
@@ -196,4 +160,26 @@ export function summarizeBulkRetry(
     message: `Retrying ${accepted} download${accepted === 1 ? '' : 's'}`,
     ok: true
   }
+}
+
+/**
+ * The one wording for a completed clear, shared by the Queue and the Library
+ * so the same action never reports itself two different ways.
+ *
+ * `kind` names the states that went ("failed", "completed"); leave it out when
+ * the scope spans several and a bare count is the honest summary.
+ */
+export function clearedMessage(removed: number, kind = ''): string {
+  const noun = removed === 1 ? 'entry' : 'entries'
+  return `Cleared ${removed} ${kind ? `${kind} ` : ''}${noun}`
+}
+
+/**
+ * "1 completed entry is" / "12 completed entries are" — the subject of a
+ * sentence the caller finishes. Both halves have to agree, so the noun and
+ * the verb are chosen together rather than by two separate ternaries that can
+ * drift apart.
+ */
+export function countPhrase(n: number, kind: string): string {
+  return n === 1 ? `1 ${kind} entry is` : `${n} ${kind} entries are`
 }

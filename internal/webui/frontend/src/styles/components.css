@@ -452,7 +452,12 @@
 }
 .row-library .cell-size { grid-area: sz; }
 .row-library .cell-date { grid-area: dt; }
-.row-failed {
+/* Two columns, not the queue's eight: a failed row has no progress, speed or
+   ETA to show. Qualified with .row-main so it outranks the several breakpoint
+   rules that re-state .row-main's own column list — matching .row-failed's
+   specificity, they used to win by coming later in the file and left the
+   title and the error reason squeezed into a 20px column. */
+.row-main.row-failed {
   grid-template-columns: minmax(0, 1fr) auto;
   grid-template-areas: 'meta act';
 }
@@ -766,10 +771,9 @@
 
 
   .row-library .cell-date::before { content: ''; }
-  .row-failed {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas: 'meta act';
-  }
+  /* The two-column failed row carries over from the desktop rule; only the
+     actions need bringing back, since handheld rows hide them in favour of
+     the kebab menu and a failed row has no kebab. */
   .row-failed .row-actions { display: flex; }
 }
 

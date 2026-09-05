@@ -12,7 +12,7 @@ const usageText = `yt-dlp-manager — one binary, four ways to run yt-dlp downlo
   yt-dlp-manager resume <id>      re-queue paused download
   yt-dlp-manager start-now <id>   prioritize now (at most 8 above concurrency limit)
   yt-dlp-manager remove <id>      remove from list (stops if running, clears partials)
-  yt-dlp-manager clear-finished   drop completed/failed rows
+  yt-dlp-manager clear-finished   drop completed, failed and files-deleted rows
   yt-dlp-manager clear-all        stop everything and empty the list
   yt-dlp-manager healthcheck      container health probe (HTTP /healthz or live socket)
   yt-dlp-manager version          print build information
