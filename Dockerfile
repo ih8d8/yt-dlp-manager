@@ -41,7 +41,7 @@ ARG ALPINE_VERSION=3.24
 # and $BUILDPLATFORM simply equals the target. This pinning still matters for
 # anyone cross-building by hand — `docker buildx build --platform linux/arm64`
 # on an amd64 machine — which is exactly the case QEMU breaks.
-FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868 AS frontend
 WORKDIR /build
 COPY internal/webui/frontend/package.json internal/webui/frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
