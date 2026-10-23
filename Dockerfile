@@ -10,7 +10,7 @@
 
 # Single source of truth for the pinned yt-dlp release. Bump it here and the
 # Makefile, Compose file and CI all follow — none of them repeat the number.
-ARG YT_DLP_VERSION=2026.08.19
+ARG YT_DLP_VERSION=2026.10.21
 
 # Alpine's tag is still an ARG because an OCI label below reports it. The FROM
 # lines are deliberately NOT parameterised: Dependabot's docker updater can only
@@ -41,7 +41,7 @@ ARG ALPINE_VERSION=3.24
 # and $BUILDPLATFORM simply equals the target. This pinning still matters for
 # anyone cross-building by hand — `docker buildx build --platform linux/arm64`
 # on an amd64 machine — which is exactly the case QEMU breaks.
-FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS frontend
 WORKDIR /build
 COPY internal/webui/frontend/package.json internal/webui/frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -49,7 +49,7 @@ COPY internal/webui/frontend/ ./
 RUN npm run typecheck && npm test && npm run build
 
 # --- Stage 2: Go builder ---------------------------------------------------
-FROM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS gobuild
+FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -68,7 +68,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/yt-dlp-manager ./cmd/yt-dlp-manager
 
 # --- Stage 3: runtime -------------------------------------------------------
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 ARG YT_DLP_VERSION
 ARG ALPINE_VERSION
 ARG APP_VERSION=dev
