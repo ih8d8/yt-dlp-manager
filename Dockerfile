@@ -10,7 +10,7 @@
 
 # Single source of truth for the pinned yt-dlp release. Bump it here and the
 # Makefile, Compose file and CI all follow — none of them repeat the number.
-ARG YT_DLP_VERSION=2026.10.21
+ARG YT_DLP_VERSION=2026.10.26
 
 # Alpine's tag is still an ARG because an OCI label below reports it. The FROM
 # lines are deliberately NOT parameterised: Dependabot's docker updater can only
