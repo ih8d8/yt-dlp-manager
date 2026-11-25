@@ -41,7 +41,7 @@ ARG ALPINE_VERSION=3.24
 # and $BUILDPLATFORM simply equals the target. This pinning still matters for
 # anyone cross-building by hand — `docker buildx build --platform linux/arm64`
 # on an amd64 machine — which is exactly the case QEMU breaks.
-FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS frontend
 WORKDIR /build
 COPY internal/webui/frontend/package.json internal/webui/frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -49,7 +49,7 @@ COPY internal/webui/frontend/ ./
 RUN npm run typecheck && npm test && npm run build
 
 # --- Stage 2: Go builder ---------------------------------------------------
-FROM golang:1.27-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS gobuild
+FROM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -68,7 +68,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/yt-dlp-manager ./cmd/yt-dlp-manager
 
 # --- Stage 3: runtime -------------------------------------------------------
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 ARG YT_DLP_VERSION
 ARG ALPINE_VERSION
 ARG APP_VERSION=dev
