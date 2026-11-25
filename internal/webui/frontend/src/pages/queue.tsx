@@ -754,7 +754,7 @@ export function DetailsDrawer({ download: d, onClose }: { download: Download; on
       <div class="drawer-overlay" aria-hidden="true" onClick={onClose} />
       <aside
         class="drawer"
-        role="dialog"
+        role={"dialog" as any}
         aria-modal="true"
         aria-label="Download details"
         tabIndex={-1}
